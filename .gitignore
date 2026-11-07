@@ -1,0 +1,24 @@
+# Dependencies & build outputs
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Local agent skills & editor configs
+.agent/
+.agents/
+.claude/
+.cursor/
+.codex/
+.vscode/
+.mcp.json
+opencode.json
+
+# IWSDK runtime state
+.iwsdk/
+
+# Local symlinked LiDAR dataset
+spatial-web-app/public/data
+
+# OS & logs
+.DS_Store
+*.log

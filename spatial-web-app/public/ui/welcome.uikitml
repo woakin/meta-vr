@@ -1,0 +1,105 @@
+<!--
+  Spatial Control Deck for Radiohead — House of Cards VR (LiDAR Point Cloud)
+-->
+<style>
+  .panel-root {
+    flex-direction: column;
+    width: 480px;
+  }
+
+  .panel-content {
+    flex-direction: column;
+    gap: 8px;
+    padding: 22px;
+  }
+
+  .eyebrow {
+    color: #00f2fe;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 1.6px;
+  }
+
+  .eyebrow:dark {
+    color: #00f2fe;
+  }
+
+  .heading {
+    color: #1c1d20;
+    font-size: 28px;
+    font-weight: 700;
+    line-height: 34px;
+  }
+
+  .heading:dark {
+    color: #fafaf7;
+  }
+
+  .body {
+    color: #3a3b40;
+    font-size: 16px;
+    line-height: 22px;
+  }
+
+  .body:dark {
+    color: #c6cbd4;
+  }
+
+  .status {
+    color: #4facfe;
+    font-size: 14px;
+    font-weight: 700;
+    margin-top: 4px;
+  }
+
+  .status:dark {
+    color: #4facfe;
+  }
+
+  .controls-row {
+    flex-direction: column;
+    gap: 10px;
+    padding-left: 22px;
+    padding-right: 22px;
+    padding-bottom: 22px;
+  }
+
+  .button {
+    justify-content: flex-start;
+  }
+
+  .button-label {
+    transform-translate-y: 1px;
+  }
+</style>
+<Panel class="panel-root">
+  <div class="panel-content">
+    <div class="eyebrow">RADIOHEAD | LIDAR HOLOGRAM</div>
+    <div class="heading">House of Cards VR</div>
+    <div class="body">Look &amp; Pinch the 3D hologram to grab and move it in space.</div>
+    <div id="status-text" class="status">Initializing LiDAR stream...</div>
+  </div>
+  <div class="controls-row">
+    <Button id="play-button" class="button">
+      <ButtonLabel id="play-label" class="button-label">Play Radiohead Sync (P)</ButtonLabel>
+    </Button>
+    <Button id="vibe-button" class="button">
+      <ButtonLabel class="button-label">Randomize Neon Vibe (V)</ButtonLabel>
+    </Button>
+    <Button id="reset-button" class="button">
+      <ButtonLabel class="button-label">Reset Hologram Position (R)</ButtonLabel>
+    </Button>
+    <Button id="xr-button" class="button">
+      <ButtonIcon>
+        <RectangleGoggles></RectangleGoggles>
+      </ButtonIcon>
+      <ButtonLabel class="button-label">Enter Meta VR Glasses Mode</ButtonLabel>
+    </Button>
+    <Button id="exit-button" class="button" style="display: none">
+      <ButtonIcon>
+        <LogIn></LogIn>
+      </ButtonIcon>
+      <ButtonLabel class="button-label">Exit to Browser</ButtonLabel>
+    </Button>
+  </div>
+</Panel>
