@@ -41,7 +41,8 @@
     },
     "features": {
       "locomotion": {
-        "useWorker": true
+        "useWorker": true,
+        "browserControls": true
       },
       "grabbing": {
         "useHandPinchForGrab": true

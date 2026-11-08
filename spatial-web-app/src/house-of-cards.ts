@@ -1,7 +1,7 @@
 import {
   createSystem,
   DistanceGrabbable,
-  Hovered,
+  LocomotionEnvironment,
   MovementMode,
   RayInteractable,
   UIKit,
@@ -15,6 +15,33 @@ const MAX_POINTS = 15000;
 const INITIAL_PREVIEW_FRAME = 41;
 const HOLOGRAM_SCALE = 0.0038;
 const DEFAULT_POS = new THREE.Vector3(0, 1.42, -1.48);
+// Desktop fly speed (m/s) for E/C vertical glide. Keys avoid Q on purpose:
+// in the XR emulator Q is the left controller trigger, so holding it would
+// distance-grab the hologram instead of sinking the camera. Driven through
+// world.setAuthoredPlayerPosition so the locomotor worker (which owns the rig
+// pose and would overwrite direct edits) stays authoritative. An invisible
+// kinematic hover platform follows at the chosen altitude, so the locomotor
+// remains grounded there instead of gravity pulling it back down. There is
+// no floor in the scene — the bounds only keep the player recoverably lost.
+const FLY_SPEED = 1.6;
+const MIN_FLY_Y = -30;
+const MAX_FLY_Y = 30;
+// Intro assembly: each point flies in from a scattered position with a
+// per-point stagger, then eases into its decoded place.
+const ASSEMBLE_SPAN = 2.4;
+const ASSEMBLE_STAGGER = 2.8;
+const CHUNK_CONCURRENCY = 4;
+
+function dataUrl(path: string): string {
+  return `${import.meta.env.BASE_URL}${path.replace(/^\/+/u, '')}`;
+}
+
+// Match a fly key by physical position (code) or by printed label (key).
+// code alone misbinds on layouts that move the letter: on AZERTY the key
+// labeled Q reports code KeyA, so labeled Q strafed instead of descending.
+function isFlyKey(e: KeyboardEvent, code: string, key: string): boolean {
+  return e.code === code || e.key.toLowerCase() === key;
+}
 
 interface FrameData {
   numPoints: number;
@@ -153,33 +180,58 @@ export class HouseOfCardsSystem extends createSystem({}) {
   };
 
   private geometry!: THREE.BufferGeometry;
+  private posAttr!: THREE.BufferAttribute;
+  private intAttr!: THREE.BufferAttribute;
   private shaderMaterial!: THREE.ShaderMaterial;
   private hologramGroup!: THREE.Group;
-  private proxyRing!: THREE.Mesh;
-  private proxyRingMaterial!: THREE.MeshBasicMaterial;
-  private hologramEntityId: number | null = null;
+  private presenting: boolean | null = null;
 
   private statusLabel: UIKit.Text | null = null;
   private playButtonLabel: UIKit.Text | null = null;
 
+  private flyUp = false;
+  private flyDown = false;
+  private flyTarget = new THREE.Vector3();
+  private hoverPlatform!: THREE.Group;
+  private flyAltitude = 0;
+
+  // Intro assembly state. basePositions holds the pristine decoded frame
+  // (the live attribute is the blended display copy); scatterPos holds each
+  // point's far starting position. Both allocated once, never in update().
+  private introStarted = false;
+  private introActive = false;
+  private introTime = 0;
+  private baseCount = 0;
+  private basePositions = new Float32Array(MAX_POINTS * 3);
+  private scatterPos = new Float32Array(MAX_POINTS * 3);
+
+  // Auto-hiding control deck.
+  private panelAsset: UIKitMLAsset | null = null;
+  private hideTimer = 0;
+  private camPos = new THREE.Vector3();
+  private camDir = new THREE.Vector3();
+  private toPanel = new THREE.Vector3();
+
   init(): void {
     // 1. Set up audio element
-    this.audio = new Audio('/data/HouseOfCards_DataSample.mp3');
+    this.audio = new Audio(dataUrl('data/HouseOfCards_DataSample.mp3'));
     this.audio.loop = true;
-    this.audio.preload = 'auto';
+    // Keep the initial network budget for the LiDAR stream; the MP3 buffers
+    // when the user presses play.
+    this.audio.preload = 'metadata';
 
     // 2. Build Three.js Point Cloud geometry + custom VR ShaderMaterial
     const initialPositions = new Float32Array(MAX_POINTS * 3);
     const initialIntensities = new Float32Array(MAX_POINTS);
 
     this.geometry = new THREE.BufferGeometry();
-    const posAttr = new THREE.BufferAttribute(initialPositions, 3);
-    posAttr.setUsage(THREE.DynamicDrawUsage);
-    const intAttr = new THREE.BufferAttribute(initialIntensities, 1);
-    intAttr.setUsage(THREE.DynamicDrawUsage);
+    this.posAttr = new THREE.BufferAttribute(initialPositions, 3);
+    this.posAttr.setUsage(THREE.DynamicDrawUsage);
+    this.intAttr = new THREE.BufferAttribute(initialIntensities, 1);
+    this.intAttr.setUsage(THREE.DynamicDrawUsage);
 
-    this.geometry.setAttribute('position', posAttr);
-    this.geometry.setAttribute('intensity', intAttr);
+    this.geometry.setAttribute('position', this.posAttr);
+    this.geometry.setAttribute('intensity', this.intAttr);
 
     this.shaderMaterial = new THREE.ShaderMaterial({
       uniforms: {
@@ -187,18 +239,30 @@ export class HouseOfCardsSystem extends createSystem({}) {
         colorB: { value: new THREE.Color('#00f2fe') },
         colorC: { value: new THREE.Color('#f093fb') },
         pointSize: { value: 3.4 },
+        uBrightness: { value: 1.0 },
       },
       vertexShader: `
         attribute float intensity;
         varying float vIntensity;
         varying float vZ;
         uniform float pointSize;
+        uniform float uBrightness;
+        varying float vBrightness;
 
         void main() {
           vIntensity = intensity;
           vZ = position.z;
           vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
-          gl_PointSize = clamp(pointSize * (2.6 / max(0.25, -mvPosition.z)), 1.5, 11.0);
+          // gl_PointSize is in DEVICE pixels. In XR the drawing buffer packs
+          // far more pixels per degree than the flat preview, so raw pixel
+          // sizes look huge and blobby in-headset. We size points as screen
+          // fractions instead: projectionMatrix[1][1] scales with the
+          // viewport height, so 0.5 / P11 normalizes it — and XR shrinks
+          // points further via uBrightness (set in update() when presenting).
+          float heightPx = 0.5 / projectionMatrix[1][1];
+          float sizeScale = pointSize * (2.6 / max(0.25, -mvPosition.z)) * heightPx;
+          gl_PointSize = clamp(sizeScale, 1.0, 10.0);
+          vBrightness = uBrightness;
           gl_Position = projectionMatrix * mvPosition;
         }
       `,
@@ -209,6 +273,7 @@ export class HouseOfCardsSystem extends createSystem({}) {
 
         varying float vIntensity;
         varying float vZ;
+        varying float vBrightness;
 
         void main() {
           if (vZ < -380.0) discard;
@@ -228,7 +293,11 @@ export class HouseOfCardsSystem extends createSystem({}) {
           }
 
           float alpha = smoothstep(0.5, 0.0, ll);
-          gl_FragColor = vec4(mixColor * (normalizedInt * 0.85 + 0.45), alpha);
+          // The tone curve defuses the additive white core when dense points
+          // overlap, preserving the bust's stripes in XR instead of blowing
+          // them to solid white.
+          vec3 display = mixColor * (normalizedInt * 0.85 + 0.45) * vBrightness;
+          gl_FragColor = vec4(display / (display + 0.75), alpha);
         }
       `,
       transparent: true,
@@ -261,20 +330,6 @@ export class HouseOfCardsSystem extends createSystem({}) {
     const hitMesh = new THREE.Mesh(hitGeo, hitMat);
     this.hologramGroup.add(hitMesh);
 
-    // Subtle glowing holographic emitter ring at the base of the bust
-    const ringGeo = new THREE.RingGeometry(0.32, 0.35, 48);
-    ringGeo.rotateX(-Math.PI / 2);
-    this.proxyRingMaterial = new THREE.MeshBasicMaterial({
-      color: 0x00f2fe,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 0.45,
-      blending: THREE.AdditiveBlending,
-    });
-    this.proxyRing = new THREE.Mesh(ringGeo, this.proxyRingMaterial);
-    this.proxyRing.position.set(0, -0.42, 0);
-    this.hologramGroup.add(this.proxyRing);
-
     this.hologramGroup.add(points);
 
     const entity = this.world.createTransformEntity(this.hologramGroup);
@@ -285,35 +340,44 @@ export class HouseOfCardsSystem extends createSystem({}) {
         movementMode: MovementMode.MoveFromTarget,
         returnToOrigin: false,
       });
-    this.hologramEntityId = entity.index;
 
-    // 4. Hide starter sample clutter so the hologram & control deck take center stage
-    for (const id of [
-      'robot',
-      'robot-contact',
-      'select-label',
-      'grab-plinth',
-      'spin-plinth',
-      'gallery-set',
-      'sideboard-set',
-    ]) {
-      const obj = this.world.getSceneObject(id);
-      if (obj) {
-        obj.visible = false;
-      }
-    }
+    // Invisible kinematic floor for free-flight. It follows the player at
+    // flyAltitude, giving the locomotor a grounded surface at any height;
+    // without it, gravity in the locomotion worker pulls E/C flight back
+    // down. Large enough that WASD never reaches an edge
+    // before the platform recenters on the next frame.
+    const platformMesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(240, 240),
+      new THREE.MeshBasicMaterial(),
+    );
+    platformMesh.rotation.x = -Math.PI / 2;
+    platformMesh.visible = false;
+    this.hoverPlatform = new THREE.Group();
+    this.hoverPlatform.name = 'HoverPlatform';
+    this.hoverPlatform.add(platformMesh);
+    this.flyAltitude = this.player.position.y;
+    this.hoverPlatform.position.set(
+      this.player.position.x,
+      this.flyAltitude,
+      this.player.position.z,
+    );
+    const platformEntity = this.world.createTransformEntity(this.hoverPlatform);
+    platformEntity.addComponent(LocomotionEnvironment, {
+      type: 'kinematic',
+    });
 
-    // 5. Wire Spatial UI Panel controls & keyboard shortcuts
+    // 4. Wire Spatial UI Panel controls & keyboard shortcuts
     this.wirePanelControls();
     this.wireKeyboardControls();
 
-    // 6. Start streaming the quantized LiDAR chunks
+    // 5. Start streaming the quantized LiDAR chunks
     void this.loadChunkStream();
   }
 
   private wirePanelControls(): void {
     const panel = this.world.getSceneObject<UIKitMLAsset>('welcome-panel');
     if (!panel) return;
+    this.panelAsset = panel;
 
     this.statusLabel = panel.getElementById<UIKit.Text>('status-text') ?? null;
     this.playButtonLabel =
@@ -322,6 +386,8 @@ export class HouseOfCardsSystem extends createSystem({}) {
     const playBtn = panel.getElementById('play-button');
     const vibeBtn = panel.getElementById('vibe-button');
     const resetBtn = panel.getElementById('reset-button');
+    const xrButton = panel.getElementById('xr-button');
+    const exitButton = panel.getElementById('exit-button');
 
     const onPlay = () => this.togglePlay();
     const onVibe = () => this.randomizeVibe();
@@ -331,11 +397,30 @@ export class HouseOfCardsSystem extends createSystem({}) {
     vibeBtn?.addEventListener('click', onVibe);
     resetBtn?.addEventListener('click', onReset);
 
+    // XR entry/exit (merged from the starter PanelSystem so this
+    // stays a single-system app).
+    if (!this.world.xrEnabled) {
+      xrButton?.setProperties({ display: 'none' });
+      exitButton?.setProperties({ display: 'none' });
+    } else {
+      const launchXR = () => this.world.launchXR();
+      const exitXR = () => this.world.exitXR();
+      xrButton?.addEventListener('click', launchXR);
+      exitButton?.addEventListener('click', exitXR);
+      this.cleanupFuncs.push(
+        () => xrButton?.removeEventListener('click', launchXR),
+        () => exitButton?.removeEventListener('click', exitXR),
+      );
+    }
+
     this.cleanupFuncs.push(
       () => playBtn?.removeEventListener('click', onPlay),
       () => vibeBtn?.removeEventListener('click', onVibe),
       () => resetBtn?.removeEventListener('click', onReset),
       this.world.visibilityState.subscribe((state) => {
+        const is2D = state === VisibilityState.NonImmersive;
+        xrButton?.setProperties({ display: is2D ? 'flex' : 'none' });
+        exitButton?.setProperties({ display: is2D ? 'none' : 'flex' });
         if (state === VisibilityState.VisibleBlurred && this.isPlaying) {
           this.audio.pause();
           this.isPlaying = false;
@@ -354,25 +439,48 @@ export class HouseOfCardsSystem extends createSystem({}) {
         return;
       }
       if (e.code === 'KeyP') {
+        if (e.repeat) return;
         e.preventDefault();
         this.togglePlay();
       } else if (e.code === 'KeyV') {
+        if (e.repeat) return;
         e.preventDefault();
         this.randomizeVibe();
       } else if (e.code === 'KeyR') {
+        if (e.repeat) return;
         e.preventDefault();
         this.resetHologram();
+      } else if (isFlyKey(e, 'KeyE', 'e')) {
+        this.flyUp = true;
+      } else if (isFlyKey(e, 'KeyC', 'c')) {
+        this.flyDown = true;
       }
     };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (isFlyKey(e, 'KeyE', 'e')) {
+        this.flyUp = false;
+      } else if (isFlyKey(e, 'KeyC', 'c')) {
+        this.flyDown = false;
+      }
+    };
+    // Avoid a stuck climb/dive if the key is released outside the window.
+    const onBlur = () => {
+      this.flyUp = false;
+      this.flyDown = false;
+    };
     window.addEventListener('keydown', onKeyDown);
-    this.cleanupFuncs.push(() =>
-      window.removeEventListener('keydown', onKeyDown),
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    this.cleanupFuncs.push(
+      () => window.removeEventListener('keydown', onKeyDown),
+      () => window.removeEventListener('keyup', onKeyUp),
+      () => window.removeEventListener('blur', onBlur),
     );
   }
 
   private updatePlayLabel(): void {
     this.playButtonLabel?.setProperties({
-      text: this.isPlaying ? 'Pause Audio & Sync' : 'Play Radiohead Sync',
+      text: this.isPlaying ? 'PAUSE AUDIO & SYNC' : 'PLAY RADIOHEAD SYNC (P)',
     });
   }
 
@@ -405,12 +513,23 @@ export class HouseOfCardsSystem extends createSystem({}) {
     this.shaderMaterial.uniforms.colorA.value.set(palette.colorA);
     this.shaderMaterial.uniforms.colorB.value.set(palette.colorB);
     this.shaderMaterial.uniforms.colorC.value.set(palette.colorC);
-    this.proxyRingMaterial.color.set(palette.colorB);
   }
 
   public resetHologram(): void {
     this.hologramGroup.position.copy(DEFAULT_POS);
     this.hologramGroup.rotation.set(0, 0, 0);
+    // Burst apart and reassemble — doubles as an intro replay. Refresh the
+    // assembly target from the currently displayed frame first.
+    const drawCount = this.geometry.drawRange.count;
+    if (Number.isFinite(drawCount) && drawCount > 0) {
+      const positions = this.posAttr.array as Float32Array;
+      this.basePositions.set(positions.subarray(0, drawCount * 3));
+      this.baseCount = drawCount;
+    }
+    if (this.baseCount > 0) {
+      this.startAssembly();
+      this.updateStatus('Assembling hologram...');
+    }
   }
 
   private initParserBuffer(buffer: ArrayBuffer): void {
@@ -440,10 +559,27 @@ export class HouseOfCardsSystem extends createSystem({}) {
     };
   }
 
+  private async fetchChunk(
+    chunk: { file: string; size?: number },
+    index: number,
+  ): Promise<ArrayBuffer> {
+    const res = await fetch(dataUrl(chunk.file));
+    if (!res.ok) {
+      throw new Error(`Chunk ${index} failed: HTTP ${res.status}`);
+    }
+    const buf = await res.arrayBuffer();
+    if (chunk.size !== undefined && buf.byteLength !== chunk.size) {
+      throw new Error(
+        `Chunk ${index} size mismatch: ${buf.byteLength} != ${chunk.size}`,
+      );
+    }
+    return buf;
+  }
+
   private async loadChunkStream(): Promise<void> {
     try {
       this.updateStatus('Loading LiDAR manifest...');
-      const manifestRes = await fetch('/data/chunks/manifest.json');
+      const manifestRes = await fetch(dataUrl('data/chunks/manifest.json'));
       if (!manifestRes.ok) {
         throw new Error(`HTTP ${manifestRes.status}`);
       }
@@ -457,12 +593,25 @@ export class HouseOfCardsSystem extends createSystem({}) {
       if (chunkList.length === 0) {
         throw new Error('Manifest has no chunks');
       }
+      if (chunkList.some((chunk) => !chunk.size || chunk.size <= 0)) {
+        throw new Error('Manifest chunks must declare positive sizes');
+      }
 
       const combined = new Uint8Array(totalSize);
+      const offsets = new Array<number>(chunkList.length);
+      let runningOffset = 0;
+      for (let i = 0; i < chunkList.length; i++) {
+        offsets[i] = runningOffset;
+        runningOffset += chunkList[i].size!;
+      }
+      if (runningOffset !== totalSize) {
+        throw new Error(
+          `Manifest size mismatch: chunks ${runningOffset} != total ${totalSize}`,
+        );
+      }
 
-      // Load chunk 0 immediately for instant preview
-      const chunk0Res = await fetch(chunkList[0].file);
-      const chunk0Buf = await chunk0Res.arrayBuffer();
+      // Load chunk 0 immediately for instant preview.
+      const chunk0Buf = await this.fetchChunk(chunkList[0], 0);
       combined.set(new Uint8Array(chunk0Buf), 0);
 
       this.initParserBuffer(combined.buffer);
@@ -475,26 +624,73 @@ export class HouseOfCardsSystem extends createSystem({}) {
         `Hologram Ready (${this.parserState.frames.length} frames) - Streaming...`,
       );
 
-      // Stream remaining chunks in the background
-      let offset = chunk0Buf.byteLength;
-      for (let i = 1; i < chunkList.length; i++) {
-        const res = await fetch(chunkList[i].file);
-        if (!res.ok) break;
-        const buf = await res.arrayBuffer();
-        combined.set(new Uint8Array(buf), offset);
-        offset += buf.byteLength;
-        this.loadedBytes = offset;
-
-        if (i % 4 === 0 || i === chunkList.length - 1) {
-          const pct = Math.min(100, Math.round((offset / totalSize) * 100));
-          advanceFrameParser(this.parserState, this.loadedBytes);
-          this.updateStatus(
-            pct === 100
-              ? `All ${this.parserState.frames.length} LiDAR Frames Ready`
-              : `Streaming LiDAR (${pct}% - ${this.parserState.frames.length} frames)`,
-          );
-        }
+      if (chunkList.length === 1) {
+        this.updateStatus(`All ${this.parserState.frames.length} LiDAR Frames Ready`);
+        return;
       }
+
+      // Fetch the rest with bounded concurrency. The parser still receives a
+      // contiguous prefix: out-of-order completions wait in `combined` until
+      // every earlier chunk has landed.
+      const completed = new Array<boolean>(chunkList.length).fill(false);
+      completed[0] = true;
+      let nextIndex = 1;
+      let contiguousIndex = 1;
+      let contiguousBytes = chunk0Buf.byteLength;
+      let downloadedBytes = chunk0Buf.byteLength;
+      let lastReportedPct = -1;
+      let failed = false;
+
+      const reportProgress = (force = false) => {
+        if (failed) return;
+        const pct = Math.min(100, Math.round((downloadedBytes / totalSize) * 100));
+        if (!force && pct === lastReportedPct) return;
+        lastReportedPct = pct;
+        advanceFrameParser(this.parserState, this.loadedBytes);
+        this.updateStatus(
+          pct === 100
+            ? `All ${this.parserState.frames.length} LiDAR Frames Ready`
+            : `Streaming LiDAR (${pct}% - ${this.parserState.frames.length} frames)`,
+        );
+      };
+
+      const worker = async (): Promise<void> => {
+        while (!failed && nextIndex < chunkList.length) {
+          const index = nextIndex;
+          nextIndex += 1;
+          let buf: ArrayBuffer;
+          try {
+            buf = await this.fetchChunk(chunkList[index], index);
+          } catch (err) {
+            failed = true;
+            throw err;
+          }
+          combined.set(new Uint8Array(buf), offsets[index]);
+          completed[index] = true;
+          downloadedBytes += buf.byteLength;
+
+          while (
+            contiguousIndex < chunkList.length &&
+            completed[contiguousIndex]
+          ) {
+            contiguousBytes =
+              offsets[contiguousIndex] + chunkList[contiguousIndex].size!;
+            contiguousIndex += 1;
+          }
+          this.loadedBytes = contiguousBytes;
+          reportProgress(index === chunkList.length - 1);
+        }
+      };
+
+      await Promise.all(
+        Array.from(
+          { length: Math.min(CHUNK_CONCURRENCY, chunkList.length - 1) },
+          () => worker(),
+        ),
+      );
+      this.loadedBytes = totalSize;
+      advanceFrameParser(this.parserState, this.loadedBytes);
+      reportProgress(true);
     } catch (err) {
       console.error('Failed to stream House of Cards LiDAR chunks:', err);
       this.updateStatus('LiDAR Load Error - check /public/data');
@@ -508,15 +704,8 @@ export class HouseOfCardsSystem extends createSystem({}) {
     if (!frame) return;
 
     const pointsToProcess = Math.min(frame.numPoints, MAX_POINTS);
-    const posAttr = this.geometry.getAttribute(
-      'position',
-    ) as THREE.BufferAttribute;
-    const intAttr = this.geometry.getAttribute(
-      'intensity',
-    ) as THREE.BufferAttribute;
-
-    const positions = posAttr.array as Float32Array;
-    const intensities = intAttr.array as Float32Array;
+    const positions = this.posAttr.array as Float32Array;
+    const intensities = this.intAttr.array as Float32Array;
 
     if (isQuantized && frame.frameMinX !== undefined && u16View && u8View) {
       const frameMinX = frame.frameMinX;
@@ -554,16 +743,83 @@ export class HouseOfCardsSystem extends createSystem({}) {
       }
     }
 
-    posAttr.clearUpdateRanges();
-    posAttr.addUpdateRange(0, pointsToProcess * 3);
-    posAttr.needsUpdate = true;
+    this.posAttr.clearUpdateRanges();
+    this.posAttr.addUpdateRange(0, pointsToProcess * 3);
+    this.posAttr.needsUpdate = true;
 
-    intAttr.clearUpdateRanges();
-    intAttr.addUpdateRange(0, pointsToProcess);
-    intAttr.needsUpdate = true;
+    this.intAttr.clearUpdateRanges();
+    this.intAttr.addUpdateRange(0, pointsToProcess);
+    this.intAttr.needsUpdate = true;
 
     this.geometry.setDrawRange(0, pointsToProcess);
     this.currentFrame = targetFrame;
+
+    // Snapshot the pristine frame only while an assembly can consume it.
+    // Copying 45k floats on every normal playback frame is wasted bandwidth.
+    if (!this.introStarted || this.introActive) {
+      this.basePositions.set(positions.subarray(0, pointsToProcess * 3));
+      this.baseCount = pointsToProcess;
+    }
+    if (!this.introStarted) {
+      this.introStarted = true;
+      this.startAssembly();
+      this.updateStatus('Assembling hologram...');
+    }
+  }
+
+  /** Scatter every point into the void and restart the fly-in. */
+  private startAssembly(): void {
+    // Scatter the full capacity, not just the first frame's count: denser
+    // frames decoded during streaming must not inherit zeroed starts.
+    for (let i = 0; i < MAX_POINTS; i += 1) {
+      // Random unit vector via spherical sampling.
+      const theta = Math.random() * Math.PI * 2;
+      const z = Math.random() * 2 - 1;
+      const r = Math.sqrt(Math.max(0, 1 - z * z));
+      const dist = 120 + Math.random() * 260;
+      const o = i * 3;
+      this.scatterPos[o] = this.basePositions[o] + r * Math.cos(theta) * dist;
+      this.scatterPos[o + 1] =
+        this.basePositions[o + 1] + r * Math.sin(theta) * dist;
+      this.scatterPos[o + 2] = this.basePositions[o + 2] + z * dist;
+    }
+    this.introTime = 0;
+    this.introActive = true;
+  }
+
+  /** Blend scattered starts into decoded targets; call once per frame. */
+  private updateAssembly(delta: number): void {
+    this.introTime += delta;
+    const positions = this.posAttr.array as Float32Array;
+    const count = this.baseCount;
+    let done = true;
+    for (let i = 0; i < count; i += 1) {
+      const t =
+        (this.introTime - (i / count) * ASSEMBLE_STAGGER) / ASSEMBLE_SPAN;
+      if (t < 1) done = false;
+      const clamped = t <= 0 ? 0 : t >= 1 ? 1 : t;
+      const e = 1 - (1 - clamped) * (1 - clamped) * (1 - clamped);
+      const o = i * 3;
+      positions[o] =
+        this.scatterPos[o] + (this.basePositions[o] - this.scatterPos[o]) * e;
+      positions[o + 1] =
+        this.scatterPos[o + 1] +
+        (this.basePositions[o + 1] - this.scatterPos[o + 1]) * e;
+      positions[o + 2] =
+        this.scatterPos[o + 2] +
+        (this.basePositions[o + 2] - this.scatterPos[o + 2]) * e;
+    }
+    this.posAttr.clearUpdateRanges();
+    this.posAttr.addUpdateRange(0, count * 3);
+    this.posAttr.needsUpdate = true;
+    if (done) {
+      this.introActive = false;
+      // Land exactly on the decoded frame (no residual float error).
+      positions.set(this.basePositions.subarray(0, count * 3));
+      this.posAttr.clearUpdateRanges();
+      this.posAttr.addUpdateRange(0, count * 3);
+      this.posAttr.needsUpdate = true;
+    }
   }
 
   update(delta: number): void {
@@ -576,7 +832,13 @@ export class HouseOfCardsSystem extends createSystem({}) {
 
     let targetFrame: number;
     if (this.isPlaying && !this.audio.paused) {
-      targetFrame = Math.floor(this.audio.currentTime * FPS) % totalLoadedFrames;
+      // Sync against the full timeline, not the still-streaming subset;
+      // otherwise the effective playback rate changes as chunks land.
+      const timelineFrames = this.parserState.totalFrames || totalLoadedFrames;
+      targetFrame = Math.floor(this.audio.currentTime * FPS) % timelineFrames;
+      if (targetFrame >= totalLoadedFrames) {
+        targetFrame = totalLoadedFrames - 1;
+      }
     } else {
       // Gentle animated breathing loop through available frames even before audio starts
       this.previewTime += delta;
@@ -586,5 +848,84 @@ export class HouseOfCardsSystem extends createSystem({}) {
     if (targetFrame !== this.currentFrame) {
       this.renderFrame(targetFrame);
     }
+
+    // Fly-in assembly runs until every point has eased home.
+    if (this.introActive) {
+      this.updateAssembly(delta);
+    }
+
+    // XR presenting: smaller, softer points. The flat preview is ~900px tall;
+    // an XR eye is ~2000px+ per eye, so without this the additive points
+    // overlap into a blown-out cloud and lose the bust's fine structure.
+    // Only write uniforms when the presenting mode actually flips.
+    const presenting =
+      this.world.visibilityState.peek() !== VisibilityState.NonImmersive;
+    if (presenting !== this.presenting) {
+      this.presenting = presenting;
+      this.shaderMaterial.uniforms.uBrightness.value = presenting ? 1.02 : 1.0;
+      this.shaderMaterial.uniforms.pointSize.value = presenting ? 2.1 : 3.4;
+    }
+
+    // Auto-hiding control deck (desktop only — the XR exit button must stay
+    // reachable in-headset). While the track plays, the card hides after a
+    // few seconds and returns the moment you look its way or pause.
+    if (this.panelAsset) {
+      const immersive = presenting;
+      if (!this.isPlaying || immersive) {
+        this.panelAsset.visible = true;
+        this.hideTimer = 0;
+      } else {
+        this.world.camera.getWorldPosition(this.camPos);
+        this.world.camera.getWorldDirection(this.camDir);
+        this.panelAsset.getWorldPosition(this.toPanel);
+        this.toPanel.sub(this.camPos).normalize();
+        if (this.camDir.dot(this.toPanel) > 0.8) {
+          this.panelAsset.visible = true;
+          this.hideTimer = 0;
+        } else {
+          this.hideTimer += delta;
+          if (this.hideTimer > 5) this.panelAsset.visible = false;
+        }
+      }
+    }
+
+    // Desktop free-flight: E rises, C sinks. Routed through the
+    // authored-placement channel so the locomotor worker teleports its
+    // internal pose instead of fighting a direct rig edit. The hover
+    // platform then holds that altitude, so releasing the key leaves the
+    // player floating — WASD slides along the platform at that height and
+    // gravity never pulls the rig back down.
+    const flyDir = (this.flyUp ? 1 : 0) - (this.flyDown ? 1 : 0);
+    if (flyDir !== 0) {
+      // Integrate from flyAltitude, not player.position.y: the rig pose is
+      // lerped back from the locomotion worker and lags the authored target.
+      // Rising stayed exact because the platform carries the rig up, but
+      // descending had to fall after the platform, so Q sank ~15% slower
+      // than E rose (and stalled further on slow frames).
+      if (this.player.position.y > this.flyAltitude + 0.5) {
+        // Something else placed the player well above the platform (e.g. an
+        // XR teleport); adopt that height instead of snapping back down.
+        this.flyAltitude = this.player.position.y;
+      }
+      const newY = Math.min(
+        MAX_FLY_Y,
+        Math.max(MIN_FLY_Y, this.flyAltitude + flyDir * FLY_SPEED * delta),
+      );
+      if (newY !== this.flyAltitude) {
+        this.flyAltitude = newY;
+        this.flyTarget.copy(this.player.position);
+        this.flyTarget.y = newY;
+        this.world.setAuthoredPlayerPosition(this.flyTarget);
+      }
+    } else if (this.player.position.y < this.flyAltitude - 0.05) {
+      // Something else placed the player lower (e.g. an XR teleport).
+      // Resync so the platform does not hover uselessly overhead.
+      this.flyAltitude = Math.max(MIN_FLY_Y, this.player.position.y);
+    }
+    this.hoverPlatform.position.set(
+      this.player.position.x,
+      this.flyAltitude,
+      this.player.position.z,
+    );
   }
 }

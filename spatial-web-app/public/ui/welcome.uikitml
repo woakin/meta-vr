@@ -1,5 +1,8 @@
 <!--
-  Spatial Control Deck for Radiohead — House of Cards VR (LiDAR Point Cloud)
+  Spatial Control Deck for Radiohead - House of Cards VR (LiDAR Point Cloud)
+  Design: "Toxic Rainbow" after Stanley Donwood's In Rainbows cover -
+  matte black field, repeated spectrum wordmark bleeding off the edge,
+  molten-wax color band, spectrum-chipped controls.
 -->
 <style>
   .panel-root {
@@ -7,53 +10,87 @@
     width: 480px;
   }
 
+  .card {
+    flex-direction: column;
+    background-color: #06070e;
+    padding-bottom: 22px;
+  }
+
+  .wordmark {
+    flex-direction: column;
+    padding-top: 16px;
+    padding-left: 22px;
+  }
+
+  .wm-row {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .lt {
+    font-size: 21px;
+    font-weight: 700;
+    line-height: 24px;
+  }
+
+  .sp {
+    width: 11px;
+  }
+
+  .c0 { color: #d92b2b; }
+  .c1 { color: #e56630; }
+  .c2 { color: #ec9746; }
+  .c3 { color: #f4d543; }
+  .c4 { color: #88b07f; }
+  .c5 { color: #3e7cb1; }
+  .c6 { color: #e86aa8; }
+
   .panel-content {
     flex-direction: column;
     gap: 8px;
-    padding: 22px;
-  }
-
-  .eyebrow {
-    color: #00f2fe;
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 1.6px;
-  }
-
-  .eyebrow:dark {
-    color: #00f2fe;
+    padding-left: 22px;
+    padding-right: 22px;
+    padding-top: 12px;
   }
 
   .heading {
-    color: #1c1d20;
-    font-size: 28px;
+    color: #f2ede3;
+    font-size: 30px;
     font-weight: 700;
     line-height: 34px;
+    letter-spacing: 0.5px;
   }
 
-  .heading:dark {
-    color: #fafaf7;
+  .wax-band {
+    flex-direction: row;
+    align-items: flex-end;
+    gap: 3px;
+    height: 14px;
+    margin-top: 4px;
+    margin-bottom: 4px;
   }
+
+  .wax { width: 26px; }
+  .wax-a { height: 9px; background-color: #b31d24; }
+  .wax-b { height: 14px; background-color: #e56630; }
+  .wax-c { height: 7px; background-color: #ec9746; }
+  .wax-d { height: 12px; background-color: #f4d543; }
+  .wax-e { height: 6px; background-color: #88b07f; }
+  .wax-f { height: 11px; background-color: #3e7cb1; }
+  .wax-g { height: 8px; background-color: #501014; }
 
   .body {
-    color: #3a3b40;
+    color: #f2ede3;
     font-size: 16px;
     line-height: 22px;
   }
 
-  .body:dark {
-    color: #c6cbd4;
-  }
-
   .status {
-    color: #4facfe;
+    color: #f4d543;
     font-size: 14px;
     font-weight: 700;
+    letter-spacing: 0.6px;
     margin-top: 4px;
-  }
-
-  .status:dark {
-    color: #4facfe;
   }
 
   .controls-row {
@@ -61,45 +98,67 @@
     gap: 10px;
     padding-left: 22px;
     padding-right: 22px;
-    padding-bottom: 22px;
+    padding-top: 14px;
   }
 
   .button {
     justify-content: flex-start;
+    align-items: center;
   }
+
+  .chip {
+    width: 10px;
+    height: 10px;
+    margin-right: 10px;
+  }
+
+  .chip-play { background-color: #d92b2b; }
+  .chip-vibe { background-color: #e56630; }
+  .chip-reset { background-color: #f4d543; }
+  .chip-xr { background-color: #88b07f; }
 
   .button-label {
     transform-translate-y: 1px;
   }
 </style>
 <Panel class="panel-root">
-  <div class="panel-content">
-    <div class="eyebrow">RADIOHEAD | LIDAR HOLOGRAM</div>
-    <div class="heading">House of Cards VR</div>
-    <div class="body">Look &amp; Pinch the 3D hologram to grab and move it in space.</div>
-    <div id="status-text" class="status">Initializing LiDAR stream...</div>
-  </div>
-  <div class="controls-row">
-    <Button id="play-button" class="button">
-      <ButtonLabel id="play-label" class="button-label">Play Radiohead Sync (P)</ButtonLabel>
-    </Button>
-    <Button id="vibe-button" class="button">
-      <ButtonLabel class="button-label">Randomize Neon Vibe (V)</ButtonLabel>
-    </Button>
-    <Button id="reset-button" class="button">
-      <ButtonLabel class="button-label">Reset Hologram Position (R)</ButtonLabel>
-    </Button>
-    <Button id="xr-button" class="button">
-      <ButtonIcon>
-        <RectangleGoggles></RectangleGoggles>
-      </ButtonIcon>
-      <ButtonLabel class="button-label">Enter Meta VR Glasses Mode</ButtonLabel>
-    </Button>
-    <Button id="exit-button" class="button" style="display: none">
-      <ButtonIcon>
-        <LogIn></LogIn>
-      </ButtonIcon>
-      <ButtonLabel class="button-label">Exit to Browser</ButtonLabel>
-    </Button>
+  <div class="card">
+    <div class="wordmark">
+      <div class="wm-row"><div class="lt c0">I</div><div class="lt c1">N</div><div class="sp"></div><div class="lt c2">R</div><div class="lt c3">A</div><div class="lt c4">I</div><div class="lt c5">N</div><div class="lt c6">B</div><div class="lt c0">O</div><div class="lt c1">W</div><div class="lt c2">S</div></div>
+      <div class="wm-row"><div class="lt c2">I</div><div class="lt c3">N</div><div class="sp"></div><div class="lt c4">R</div><div class="lt c5">A</div><div class="lt c6">I</div><div class="lt c0">N</div><div class="lt c1">B</div><div class="lt c2">O</div><div class="lt c3">W</div><div class="lt c4">S</div></div>
+      <div class="wm-row"><div class="lt c4">I</div><div class="lt c5">N</div><div class="sp"></div><div class="lt c6">R</div><div class="lt c0">A</div><div class="lt c1">I</div><div class="lt c2">N</div><div class="lt c3">B</div><div class="lt c4">O</div><div class="lt c5">W</div><div class="lt c6">S</div></div>
+    </div>
+    <div class="panel-content">
+      <div class="heading">HOUSE OF CARDS</div>
+      <div class="wax-band">
+        <div class="wax wax-a"></div><div class="wax wax-b"></div><div class="wax wax-c"></div><div class="wax wax-d"></div><div class="wax wax-e"></div><div class="wax wax-f"></div><div class="wax wax-b"></div><div class="wax wax-g"></div><div class="wax wax-d"></div><div class="wax wax-a"></div><div class="wax wax-f"></div><div class="wax wax-c"></div>
+      </div>
+      <div class="body">Look &amp; Pinch the 3D hologram to grab and move it in space. On desktop: WASD to glide, E/C to float up/down.</div>
+      <div id="status-text" class="status">INITIALIZING LIDAR STREAM...</div>
+    </div>
+    <div class="controls-row">
+      <Button id="play-button" class="button">
+        <div class="chip chip-play"></div>
+        <ButtonLabel id="play-label" class="button-label">PLAY RADIOHEAD SYNC (P)</ButtonLabel>
+      </Button>
+      <Button id="vibe-button" class="button">
+        <div class="chip chip-vibe"></div>
+        <ButtonLabel class="button-label">RANDOMIZE NEON VIBE (V)</ButtonLabel>
+      </Button>
+      <Button id="reset-button" class="button">
+        <div class="chip chip-reset"></div>
+        <ButtonLabel class="button-label">RESET HOLOGRAM POSITION (R)</ButtonLabel>
+      </Button>
+      <Button id="xr-button" class="button">
+        <div class="chip chip-xr"></div>
+        <ButtonLabel class="button-label">ENTER META VR GLASSES MODE</ButtonLabel>
+      </Button>
+      <Button id="exit-button" class="button" style="display: none">
+        <ButtonIcon>
+          <LogIn></LogIn>
+        </ButtonIcon>
+        <ButtonLabel class="button-label">EXIT TO BROWSER</ButtonLabel>
+      </Button>
+    </div>
   </div>
 </Panel>
