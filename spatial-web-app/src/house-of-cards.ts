@@ -1,20 +1,32 @@
 import {
+  AdditiveBlending,
+  BufferAttribute,
+  BufferGeometry,
+  Color,
   createSystem,
   DistanceGrabbable,
+  DynamicDrawUsage,
+  Group,
   LocomotionEnvironment,
+  Mesh,
+  MeshBasicMaterial,
   MovementMode,
+  PlaneGeometry,
+  Points,
   RayInteractable,
+  ShaderMaterial,
+  SphereGeometry,
   UIKit,
   UIKitMLAsset,
+  Vector3,
   VisibilityState,
 } from '@iwsdk/core';
-import * as THREE from 'three';
 
 const FPS = 30;
 const MAX_POINTS = 15000;
 const INITIAL_PREVIEW_FRAME = 41;
 const HOLOGRAM_SCALE = 0.0038;
-const DEFAULT_POS = new THREE.Vector3(0, 1.42, -1.48);
+const DEFAULT_POS = new Vector3(0, 1.42, -1.48);
 // Desktop fly speed (m/s) for E/C vertical glide. Keys avoid Q on purpose:
 // in the XR emulator Q is the left controller trigger, so holding it would
 // distance-grab the hologram instead of sinking the camera. Driven through
@@ -40,12 +52,38 @@ function dataUrl(path: string): string {
 // code alone misbinds on layouts that move the letter: on AZERTY the key
 // labeled Q reports code KeyA, so labeled Q strafed instead of descending.
 function isFlyKey(e: KeyboardEvent, code: string, key: string): boolean {
+  if (e.ctrlKey || e.altKey || e.metaKey) return false;
   return e.code === code || e.key.toLowerCase() === key;
 }
 
+function isActionKey(e: KeyboardEvent, code: string, key: string): boolean {
+  return isFlyKey(e, code, key);
+}
+
+// Deterministic PRNG (mulberry32) so intro scatter is identical in the
+// runtime and editor realms and across resets.
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// One parsed frame. Point data lives either inside a single landed chunk
+// (chunkIndex/offsetInChunk address it with the chunk's own typed-array
+// views) or in a small scratch copy (frames straddling a chunk boundary,
+// or chunk-local frames whose offset would misalign a u16/float view).
 interface FrameData {
   numPoints: number;
-  byteOffset: number;
+  /** Byte offset of the point-data start inside its source buffer. */
+  dataOffset: number;
+  /** Index into ParserState.chunks, or -1 when reading from `scratch`. */
+  chunkIndex: number;
+  /** Offset of the point data inside the scratch copy, when straddled. */
+  scratch: ArrayBuffer | null;
   floatOffset?: number;
   frameMinX?: number;
   rangeX?: number;
@@ -55,82 +93,189 @@ interface FrameData {
   rangeZ?: number;
 }
 
-interface ParserState {
-  buffer: ArrayBuffer | null;
-  dataview: DataView | null;
-  floatData: Float32Array | null;
-  u8View: Uint8Array | null;
-  u16View: Uint16Array | null;
+const HEADER_BYTES = 28; // quantized frame header
+
+export interface ParserState {
+  /** Landed chunk buffers by manifest index; null = not yet arrived. */
+  chunks: (ArrayBuffer | null)[];
+  /** Virtual (concatenated-stream) start offset of each chunk. */
+  chunkOffsets: number[];
+  /** Virtual start offset of the chunk that holds frame point data. */
+  initialized: boolean;
   isQuantized: boolean;
   totalFrames: number;
   nextByteOffset: number;
-  lastParsedBytes: number;
   frames: FrameData[];
+  /** Latched parse error; parsing stops when set. */
+  parseError: string | null;
+  /** Scratch buffers retained for straddled/misaligned frames. */
+  scratchPool: ArrayBuffer[];
 }
 
-function advanceFrameParser(
+// Locate which landed chunk contains a virtual stream offset, or -1.
+function locateChunk(state: ParserState, virtualOffset: number): number {
+  const offsets = state.chunkOffsets;
+  let lo = 0;
+  let hi = offsets.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (offsets[mid] <= virtualOffset) {
+      found = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (found < 0) return -1;
+  const chunk = state.chunks[found];
+  if (!chunk) return -1;
+  return virtualOffset - offsets[found] < chunk.byteLength ? found : -1;
+}
+
+// Copy [virtualStart, virtualStart+length) into a small contiguous buffer.
+// Returns null when any byte of the range has not landed yet.
+function copyRange(
   state: ParserState,
-  effectiveLoadedBytes: number,
-): void {
-  if (!state.dataview || effectiveLoadedBytes <= state.lastParsedBytes) {
+  virtualStart: number,
+  length: number,
+): ArrayBuffer | null {
+  const out = new ArrayBuffer(length);
+  const dst = new Uint8Array(out);
+  for (let i = 0; i < length; i++) {
+    const virtual = virtualStart + i;
+    const chunkIndex = locateChunk(state, virtual);
+    if (chunkIndex < 0) return null;
+    const src = state.chunks[chunkIndex]!;
+    dst[i] = new Uint8Array(src)[virtual - state.chunkOffsets[chunkIndex]];
+  }
+  return out;
+}
+
+// Read a little-endian u32 at a virtual offset; null when not landed.
+function readU32(state: ParserState, virtualOffset: number): number | null {
+  let value = 0;
+  for (let i = 0; i < 4; i++) {
+    const chunkIndex = locateChunk(state, virtualOffset + i);
+    if (chunkIndex < 0) return null;
+    const src = state.chunks[chunkIndex]!;
+    value +=
+      new Uint8Array(src)[virtualOffset + i - state.chunkOffsets[chunkIndex]] *
+      2 ** (8 * i);
+  }
+  return value;
+}
+
+export function advanceFrameParser(state: ParserState): void {
+  if (state.parseError || !state.initialized) return;
+  const totalFrames = state.totalFrames;
+  if (!Number.isInteger(totalFrames) || totalFrames <= 0) {
+    state.parseError = `Invalid totalFrames in stream header: ${totalFrames}`;
     return;
   }
 
-  const dataview = state.dataview;
-  const frames = state.frames;
-  const totalFrames = state.totalFrames;
-  let byteOffset = state.nextByteOffset;
-
-  if (state.isQuantized) {
-    while (frames.length < totalFrames) {
-      if (byteOffset + 28 > effectiveLoadedBytes) break;
-
-      const numPoints = dataview.getUint32(byteOffset, true);
-      if (numPoints === 0 || numPoints > MAX_POINTS * 2) break;
-
-      const frameSize = 28 + numPoints * 8;
-      if (byteOffset + frameSize > effectiveLoadedBytes) break;
-
-      const hOffset = byteOffset + 4;
-      const frameMinX = dataview.getFloat32(hOffset, true);
-      const frameMaxX = dataview.getFloat32(hOffset + 4, true);
-      const frameMinY = dataview.getFloat32(hOffset + 8, true);
-      const frameMaxY = dataview.getFloat32(hOffset + 12, true);
-      const frameMinZ = dataview.getFloat32(hOffset + 16, true);
-      const frameMaxZ = dataview.getFloat32(hOffset + 20, true);
-
-      frames.push({
-        numPoints,
-        byteOffset: byteOffset + 28,
-        frameMinX,
-        rangeX: frameMaxX - frameMinX || 1,
-        frameMinY,
-        rangeY: frameMaxY - frameMinY || 1,
-        frameMinZ,
-        rangeZ: frameMaxZ - frameMinZ || 1,
-      });
-      byteOffset += frameSize;
+  while (state.frames.length < totalFrames) {
+    const frameStart = state.nextByteOffset;
+    const numPoints = readU32(state, frameStart);
+    if (numPoints === null) return; // header bytes have not landed yet
+    if (numPoints === 0 || numPoints > MAX_POINTS * 2) {
+      state.parseError =
+        `Invalid numPoints ${numPoints} at stream offset ${frameStart}`;
+      return;
     }
-  } else {
-    while (frames.length < totalFrames) {
-      if (byteOffset + 4 > effectiveLoadedBytes) break;
-      const numPoints = dataview.getUint32(byteOffset, true);
-      if (numPoints === 0 || numPoints > MAX_POINTS * 2) break;
 
-      const frameSize = 4 + numPoints * 16;
-      if (byteOffset + frameSize > effectiveLoadedBytes) break;
+    const headerSize = state.isQuantized ? HEADER_BYTES : 4;
+    const frameSize = headerSize + numPoints * (state.isQuantized ? 8 : 16);
+    const frameEnd = frameStart + frameSize;
 
-      frames.push({
-        numPoints,
-        byteOffset: byteOffset + 4,
-        floatOffset: (byteOffset + 4) / 4,
-      });
-      byteOffset += frameSize;
+    // Point-data start, as a chunk-local offset plus the source chunk.
+    // The whole frame (header included) must share one chunk, otherwise
+    // header reads would run off the chunk that holds the body.
+    const dataVirtual = frameStart + headerSize;
+    const headerChunkIndex = locateChunk(state, frameStart);
+    const chunkIndex = locateChunk(state, dataVirtual);
+    const dataChunk = chunkIndex >= 0 ? state.chunks[chunkIndex] : null;
+    const endChunkIndex = locateChunk(state, frameEnd - 1);
+    const straddled =
+      headerChunkIndex < 0 ||
+      chunkIndex < 0 ||
+      endChunkIndex !== chunkIndex ||
+      chunkIndex !== headerChunkIndex ||
+      !dataChunk;
+    const misaligned =
+      !straddled &&
+      (state.isQuantized
+        ? (dataVirtual - state.chunkOffsets[chunkIndex]) % 2 !== 0
+        : (dataVirtual - state.chunkOffsets[chunkIndex]) % 4 !== 0);
+
+    if (straddled || misaligned) {
+      const scratch = copyRange(state, frameStart, frameSize);
+      if (scratch === null) return; // frame bytes have not landed yet
+      state.scratchPool.push(scratch);
+      const scratchView = new DataView(scratch);
+      if (state.isQuantized) {
+        const h = 4;
+        state.frames.push({
+          numPoints,
+          dataOffset: headerSize,
+          chunkIndex: -1,
+          scratch,
+          frameMinX: scratchView.getFloat32(h, true),
+          rangeX:
+            scratchView.getFloat32(h + 4, true) -
+            scratchView.getFloat32(h, true) ||
+            1,
+          frameMinY: scratchView.getFloat32(h + 8, true),
+          rangeY:
+            scratchView.getFloat32(h + 12, true) -
+            scratchView.getFloat32(h + 8, true) ||
+            1,
+          frameMinZ: scratchView.getFloat32(h + 16, true),
+          rangeZ:
+            scratchView.getFloat32(h + 20, true) -
+            scratchView.getFloat32(h + 16, true) ||
+            1,
+        });
+      } else {
+        state.frames.push({
+          numPoints,
+          dataOffset: headerSize,
+          chunkIndex: -1,
+          scratch,
+          floatOffset: headerSize / 4,
+        });
+      }
+    } else {
+      const view = new DataView(state.chunks[chunkIndex]!);
+      const dataOffset = dataVirtual - state.chunkOffsets[chunkIndex];
+      if (state.isQuantized) {
+        const h = dataOffset - HEADER_BYTES + 4;
+        state.frames.push({
+          numPoints,
+          dataOffset,
+          chunkIndex,
+          scratch: null,
+          frameMinX: view.getFloat32(h, true),
+          rangeX: view.getFloat32(h + 4, true) - view.getFloat32(h, true) || 1,
+          frameMinY: view.getFloat32(h + 8, true),
+          rangeY:
+            view.getFloat32(h + 12, true) - view.getFloat32(h + 8, true) || 1,
+          frameMinZ: view.getFloat32(h + 16, true),
+          rangeZ:
+            view.getFloat32(h + 20, true) - view.getFloat32(h + 16, true) || 1,
+        });
+      } else {
+        state.frames.push({
+          numPoints,
+          dataOffset,
+          chunkIndex,
+          scratch: null,
+          floatOffset: dataOffset / 4,
+        });
+      }
     }
+    state.nextByteOffset = frameEnd;
   }
-
-  state.nextByteOffset = byteOffset;
-  state.lastParsedBytes = effectiveLoadedBytes;
 }
 
 function generateNeonPalette(): {
@@ -167,23 +312,30 @@ export class HouseOfCardsSystem extends createSystem({}) {
   private previewTime = 0;
 
   private parserState: ParserState = {
-    buffer: null,
-    dataview: null,
-    floatData: null,
-    u8View: null,
-    u16View: null,
+    chunks: [],
+    chunkOffsets: [],
+    initialized: false,
     isQuantized: false,
     totalFrames: 0,
     nextByteOffset: 0,
-    lastParsedBytes: 0,
     frames: [],
+    parseError: null,
+    scratchPool: [],
   };
 
-  private geometry!: THREE.BufferGeometry;
-  private posAttr!: THREE.BufferAttribute;
-  private intAttr!: THREE.BufferAttribute;
-  private shaderMaterial!: THREE.ShaderMaterial;
-  private hologramGroup!: THREE.Group;
+  private abortController = new AbortController();
+  private platformGeometry: BufferGeometry | null = null;
+  private platformMaterial: MeshBasicMaterial | null = null;
+  private hitGeometry: BufferGeometry | null = null;
+  private hitMaterial: MeshBasicMaterial | null = null;
+  private assemblySeed = 1337;
+  private assemblyRandom = mulberry32(this.assemblySeed);
+
+  private geometry!: BufferGeometry;
+  private posAttr!: BufferAttribute;
+  private intAttr!: BufferAttribute;
+  private shaderMaterial!: ShaderMaterial;
+  private hologramGroup!: Group;
   private presenting: boolean | null = null;
 
   private statusLabel: UIKit.Text | null = null;
@@ -191,8 +343,8 @@ export class HouseOfCardsSystem extends createSystem({}) {
 
   private flyUp = false;
   private flyDown = false;
-  private flyTarget = new THREE.Vector3();
-  private hoverPlatform!: THREE.Group;
+  private flyTarget = new Vector3();
+  private hoverPlatform!: Group;
   private flyAltitude = 0;
 
   // Intro assembly state. basePositions holds the pristine decoded frame
@@ -208,9 +360,9 @@ export class HouseOfCardsSystem extends createSystem({}) {
   // Auto-hiding control deck.
   private panelAsset: UIKitMLAsset | null = null;
   private hideTimer = 0;
-  private camPos = new THREE.Vector3();
-  private camDir = new THREE.Vector3();
-  private toPanel = new THREE.Vector3();
+  private camPos = new Vector3();
+  private camDir = new Vector3();
+  private toPanel = new Vector3();
 
   init(): void {
     // 1. Set up audio element
@@ -224,20 +376,20 @@ export class HouseOfCardsSystem extends createSystem({}) {
     const initialPositions = new Float32Array(MAX_POINTS * 3);
     const initialIntensities = new Float32Array(MAX_POINTS);
 
-    this.geometry = new THREE.BufferGeometry();
-    this.posAttr = new THREE.BufferAttribute(initialPositions, 3);
-    this.posAttr.setUsage(THREE.DynamicDrawUsage);
-    this.intAttr = new THREE.BufferAttribute(initialIntensities, 1);
-    this.intAttr.setUsage(THREE.DynamicDrawUsage);
+    this.geometry = new BufferGeometry();
+    this.posAttr = new BufferAttribute(initialPositions, 3);
+    this.posAttr.setUsage(DynamicDrawUsage);
+    this.intAttr = new BufferAttribute(initialIntensities, 1);
+    this.intAttr.setUsage(DynamicDrawUsage);
 
     this.geometry.setAttribute('position', this.posAttr);
     this.geometry.setAttribute('intensity', this.intAttr);
 
-    this.shaderMaterial = new THREE.ShaderMaterial({
+    this.shaderMaterial = new ShaderMaterial({
       uniforms: {
-        colorA: { value: new THREE.Color('#4facfe') },
-        colorB: { value: new THREE.Color('#00f2fe') },
-        colorC: { value: new THREE.Color('#f093fb') },
+        colorA: { value: new Color('#4facfe') },
+        colorB: { value: new Color('#00f2fe') },
+        colorC: { value: new Color('#f093fb') },
         pointSize: { value: 3.4 },
         uBrightness: { value: 1.0 },
       },
@@ -302,10 +454,12 @@ export class HouseOfCardsSystem extends createSystem({}) {
       `,
       transparent: true,
       depthWrite: false,
-      blending: THREE.AdditiveBlending,
+      blending: AdditiveBlending,
     });
 
-    const points = new THREE.Points(this.geometry, this.shaderMaterial);
+    const points = new Points(this.geometry, this.shaderMaterial);
+    // Draw range changes every frame, so a static bounding sphere would
+    // cull incorrectly. Skip culling rather than recomputing bounds.
     points.frustumCulled = false;
     points.rotation.set(0, 0, Math.PI);
     points.scale.setScalar(HOLOGRAM_SCALE);
@@ -317,17 +471,19 @@ export class HouseOfCardsSystem extends createSystem({}) {
     );
 
     // 3. Create a grabbable hologram container with a subtle base ring & hit sphere
-    this.hologramGroup = new THREE.Group();
+    this.hologramGroup = new Group();
     this.hologramGroup.name = 'HouseOfCardsHologram';
 
     // Invisible hit volume so Gaze + Pinch raycasting can easily target the point cloud
-    const hitGeo = new THREE.SphereGeometry(0.42, 16, 16);
-    const hitMat = new THREE.MeshBasicMaterial({
+    const hitGeo = new SphereGeometry(0.42, 16, 16);
+    const hitMat = new MeshBasicMaterial({
       transparent: true,
       opacity: 0.0,
       depthWrite: false,
     });
-    const hitMesh = new THREE.Mesh(hitGeo, hitMat);
+    this.hitGeometry = hitGeo;
+    this.hitMaterial = hitMat;
+    const hitMesh = new Mesh(hitGeo, hitMat);
     this.hologramGroup.add(hitMesh);
 
     this.hologramGroup.add(points);
@@ -346,13 +502,15 @@ export class HouseOfCardsSystem extends createSystem({}) {
     // without it, gravity in the locomotion worker pulls E/C flight back
     // down. Large enough that WASD never reaches an edge
     // before the platform recenters on the next frame.
-    const platformMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(240, 240),
-      new THREE.MeshBasicMaterial(),
+    this.platformGeometry = new PlaneGeometry(240, 240);
+    this.platformMaterial = new MeshBasicMaterial();
+    const platformMesh = new Mesh(
+      this.platformGeometry,
+      this.platformMaterial,
     );
     platformMesh.rotation.x = -Math.PI / 2;
     platformMesh.visible = false;
-    this.hoverPlatform = new THREE.Group();
+    this.hoverPlatform = new Group();
     this.hoverPlatform.name = 'HoverPlatform';
     this.hoverPlatform.add(platformMesh);
     this.flyAltitude = this.player.position.y;
@@ -371,12 +529,27 @@ export class HouseOfCardsSystem extends createSystem({}) {
     this.wireKeyboardControls();
 
     // 5. Start streaming the quantized LiDAR chunks
+    this.cleanupFuncs.push(() => {
+      this.abortController.abort();
+      this.geometry?.dispose();
+      this.shaderMaterial?.dispose();
+      this.hitGeometry?.dispose();
+      this.hitMaterial?.dispose();
+      this.platformGeometry?.dispose();
+      this.platformMaterial?.dispose();
+      if (!this.audio.paused) this.audio.pause();
+    });
     void this.loadChunkStream();
   }
 
   private wirePanelControls(): void {
     const panel = this.world.getSceneObject<UIKitMLAsset>('welcome-panel');
-    if (!panel) return;
+    if (!panel) {
+      console.error(
+        '[HouseOfCards] welcome-panel scene object not found; panel controls disabled.',
+      );
+      return;
+    }
     this.panelAsset = panel;
 
     this.statusLabel = panel.getElementById<UIKit.Text>('status-text') ?? null;
@@ -417,7 +590,9 @@ export class HouseOfCardsSystem extends createSystem({}) {
       () => playBtn?.removeEventListener('click', onPlay),
       () => vibeBtn?.removeEventListener('click', onVibe),
       () => resetBtn?.removeEventListener('click', onReset),
-      this.world.visibilityState.subscribe((state) => {
+    );
+    const unsubscribeVisibility = this.world.visibilityState.subscribe(
+      (state) => {
         const is2D = state === VisibilityState.NonImmersive;
         xrButton?.setProperties({ display: is2D ? 'flex' : 'none' });
         exitButton?.setProperties({ display: is2D ? 'none' : 'flex' });
@@ -426,8 +601,9 @@ export class HouseOfCardsSystem extends createSystem({}) {
           this.isPlaying = false;
           this.updatePlayLabel();
         }
-      }),
+      },
     );
+    this.cleanupFuncs.push(unsubscribeVisibility);
   }
 
   private wireKeyboardControls(): void {
@@ -438,15 +614,15 @@ export class HouseOfCardsSystem extends createSystem({}) {
       ) {
         return;
       }
-      if (e.code === 'KeyP') {
+      if (isActionKey(e, 'KeyP', 'p')) {
         if (e.repeat) return;
         e.preventDefault();
         this.togglePlay();
-      } else if (e.code === 'KeyV') {
+      } else if (isActionKey(e, 'KeyV', 'v')) {
         if (e.repeat) return;
         e.preventDefault();
         this.randomizeVibe();
-      } else if (e.code === 'KeyR') {
+      } else if (isActionKey(e, 'KeyR', 'r')) {
         if (e.repeat) return;
         e.preventDefault();
         this.resetHologram();
@@ -498,7 +674,7 @@ export class HouseOfCardsSystem extends createSystem({}) {
         })
         .catch((err) => {
           console.warn('Audio play blocked, advancing procedurally:', err);
-          this.isPlaying = !this.isPlaying;
+          this.isPlaying = false;
           this.updatePlayLabel();
         });
     } else {
@@ -518,23 +694,43 @@ export class HouseOfCardsSystem extends createSystem({}) {
   public resetHologram(): void {
     this.hologramGroup.position.copy(DEFAULT_POS);
     this.hologramGroup.rotation.set(0, 0, 0);
-    // Burst apart and reassemble — doubles as an intro replay. Refresh the
-    // assembly target from the currently displayed frame first.
-    const drawCount = this.geometry.drawRange.count;
-    if (Number.isFinite(drawCount) && drawCount > 0) {
-      const positions = this.posAttr.array as Float32Array;
-      this.basePositions.set(positions.subarray(0, drawCount * 3));
-      this.baseCount = drawCount;
+    // Burst apart and reassemble — doubles as an intro replay. Re-decode
+    // the current frame so the assembly targets a pristine decoded
+    // position, never a mid-blend position.
+    if (this.currentFrame >= 0) {
+      const frame = this.parserState.frames[this.currentFrame];
+      if (frame) {
+        const positions = this.posAttr.array as Float32Array;
+        const intensities = this.intAttr.array as Float32Array;
+        const count = this.decodeFrameIntoAttributes(
+          frame,
+          positions,
+          intensities,
+        );
+        if (count > 0) {
+          this.basePositions.set(positions.subarray(0, count * 3));
+          this.baseCount = count;
+        }
+      }
     }
     if (this.baseCount > 0) {
       this.startAssembly();
       this.updateStatus('Assembling hologram...');
+    } else {
+      this.updateStatus('No decoded frame yet - waiting for LiDAR stream...');
     }
   }
 
-  private initParserBuffer(buffer: ArrayBuffer): void {
-    const dataview = new DataView(buffer);
-    const magicView = new Uint8Array(buffer, 0, 4);
+  // Initialize from landed chunk 0 only. Later chunks are stored per-index;
+  // the parser addresses the concatenated stream without a 205 MB buffer.
+  private initParserBuffer(chunk0: ArrayBuffer): void {
+    if (chunk0.byteLength < 8) {
+      throw new Error(
+        `Stream header truncated: chunk 0 has ${chunk0.byteLength} bytes`,
+      );
+    }
+    const dataview = new DataView(chunk0);
+    const magicView = new Uint8Array(chunk0, 0, 4);
     const isQuant =
       magicView[0] === 0x48 &&
       magicView[1] === 0x4f &&
@@ -544,18 +740,20 @@ export class HouseOfCardsSystem extends createSystem({}) {
     const totalFrames = isQuant
       ? dataview.getUint32(4, true)
       : dataview.getUint32(0, true);
+    if (!Number.isInteger(totalFrames) || totalFrames <= 0) {
+      throw new Error(`Invalid totalFrames in stream header: ${totalFrames}`);
+    }
 
     this.parserState = {
-      buffer,
-      dataview,
-      floatData: isQuant ? null : new Float32Array(buffer),
-      u8View: new Uint8Array(buffer),
-      u16View: new Uint16Array(buffer),
+      chunks: [chunk0],
+      chunkOffsets: [0],
+      initialized: true,
       isQuantized: isQuant,
       totalFrames,
       nextByteOffset: isQuant ? 8 : 4,
-      lastParsedBytes: 0,
       frames: [],
+      parseError: null,
+      scratchPool: [],
     };
   }
 
@@ -563,7 +761,9 @@ export class HouseOfCardsSystem extends createSystem({}) {
     chunk: { file: string; size?: number },
     index: number,
   ): Promise<ArrayBuffer> {
-    const res = await fetch(dataUrl(chunk.file));
+    const res = await fetch(dataUrl(chunk.file), {
+      signal: this.abortController.signal,
+    });
     if (!res.ok) {
       throw new Error(`Chunk ${index} failed: HTTP ${res.status}`);
     }
@@ -597,7 +797,6 @@ export class HouseOfCardsSystem extends createSystem({}) {
         throw new Error('Manifest chunks must declare positive sizes');
       }
 
-      const combined = new Uint8Array(totalSize);
       const offsets = new Array<number>(chunkList.length);
       let runningOffset = 0;
       for (let i = 0; i < chunkList.length; i++) {
@@ -612,11 +811,10 @@ export class HouseOfCardsSystem extends createSystem({}) {
 
       // Load chunk 0 immediately for instant preview.
       const chunk0Buf = await this.fetchChunk(chunkList[0], 0);
-      combined.set(new Uint8Array(chunk0Buf), 0);
 
-      this.initParserBuffer(combined.buffer);
+      this.initParserBuffer(chunk0Buf);
       this.loadedBytes = chunk0Buf.byteLength;
-      advanceFrameParser(this.parserState, this.loadedBytes);
+      advanceFrameParser(this.parserState);
       this.renderFrame(
         Math.min(INITIAL_PREVIEW_FRAME, this.parserState.frames.length - 1),
       );
@@ -646,7 +844,11 @@ export class HouseOfCardsSystem extends createSystem({}) {
         const pct = Math.min(100, Math.round((downloadedBytes / totalSize) * 100));
         if (!force && pct === lastReportedPct) return;
         lastReportedPct = pct;
-        advanceFrameParser(this.parserState, this.loadedBytes);
+        advanceFrameParser(this.parserState);
+        if (this.parserState.parseError) {
+          this.updateStatus(`LiDAR Parse Error: ${this.parserState.parseError}`);
+          return;
+        }
         this.updateStatus(
           pct === 100
             ? `All ${this.parserState.frames.length} LiDAR Frames Ready`
@@ -665,7 +867,11 @@ export class HouseOfCardsSystem extends createSystem({}) {
             failed = true;
             throw err;
           }
-          combined.set(new Uint8Array(buf), offsets[index]);
+          // Store per-index instead of copying into a contiguous buffer.
+          if (!this.parserState.chunks[index]) {
+            this.parserState.chunks[index] = buf;
+            this.parserState.chunkOffsets[index] = offsets[index];
+          }
           completed[index] = true;
           downloadedBytes += buf.byteLength;
 
@@ -689,25 +895,36 @@ export class HouseOfCardsSystem extends createSystem({}) {
         ),
       );
       this.loadedBytes = totalSize;
-      advanceFrameParser(this.parserState, this.loadedBytes);
+      advanceFrameParser(this.parserState);
       reportProgress(true);
     } catch (err) {
+      if (this.abortController.signal.aborted) return;
       console.error('Failed to stream House of Cards LiDAR chunks:', err);
       this.updateStatus('LiDAR Load Error - check /public/data');
     }
   }
 
-  private renderFrame(targetFrame: number): void {
-    const { frames, isQuantized, u16View, u8View, floatData } =
-      this.parserState;
-    const frame = frames[targetFrame];
-    if (!frame) return;
-
+  private decodeFrameIntoAttributes(
+    frame: FrameData,
+    positions: Float32Array,
+    intensities: Float32Array,
+  ): number {
     const pointsToProcess = Math.min(frame.numPoints, MAX_POINTS);
-    const positions = this.posAttr.array as Float32Array;
-    const intensities = this.intAttr.array as Float32Array;
+    const source =
+      frame.chunkIndex >= 0
+        ? this.parserState.chunks[frame.chunkIndex]
+        : frame.scratch;
+    if (!source) return 0;
+    const u8View = new Uint8Array(source);
+    const u16View = new Uint16Array(source);
+    const floatData = new Float32Array(source);
 
-    if (isQuantized && frame.frameMinX !== undefined && u16View && u8View) {
+    if (
+      this.parserState.isQuantized &&
+      frame.frameMinX !== undefined &&
+      u16View &&
+      u8View
+    ) {
       const frameMinX = frame.frameMinX;
       const frameMinY = frame.frameMinY!;
       const frameMinZ = frame.frameMinZ!;
@@ -715,8 +932,8 @@ export class HouseOfCardsSystem extends createSystem({}) {
       const scaleY = frame.rangeY! / 65535;
       const scaleZ = frame.rangeZ! / 65535;
 
-      let pOffset = frame.byteOffset + 6;
-      let u16Idx = frame.byteOffset >> 1;
+      let pOffset = frame.dataOffset + 6;
+      let u16Idx = frame.dataOffset >> 1;
       let outIdx = 0;
 
       for (let i = 0; i < pointsToProcess; i++) {
@@ -742,7 +959,25 @@ export class HouseOfCardsSystem extends createSystem({}) {
         outIdx += 3;
       }
     }
+    return pointsToProcess;
+  }
 
+  private renderFrame(targetFrame: number): void {
+    const frame = this.parserState.frames[targetFrame];
+    if (!frame) return;
+
+    const positions = this.posAttr.array as Float32Array;
+    const intensities = this.intAttr.array as Float32Array;
+    const pointsToProcess = this.decodeFrameIntoAttributes(
+      frame,
+      positions,
+      intensities,
+    );
+    if (pointsToProcess <= 0) return;
+
+    // Single upload pass. When an assembly is active the same range is
+    // blended in place right after; flagging here and again in updateAssembly
+    // would upload twice per frame.
     this.posAttr.clearUpdateRanges();
     this.posAttr.addUpdateRange(0, pointsToProcess * 3);
     this.posAttr.needsUpdate = true;
@@ -754,13 +989,13 @@ export class HouseOfCardsSystem extends createSystem({}) {
     this.geometry.setDrawRange(0, pointsToProcess);
     this.currentFrame = targetFrame;
 
-    // Snapshot the pristine frame only while an assembly can consume it.
+    // Snapshot the pristine frame only when an assembly can consume it.
     // Copying 45k floats on every normal playback frame is wasted bandwidth.
-    if (!this.introStarted || this.introActive) {
+    // While assembling, the frame is held (update() skips advance), so the
+    // base stays frozen and points ease to a stable target.
+    if (!this.introStarted) {
       this.basePositions.set(positions.subarray(0, pointsToProcess * 3));
       this.baseCount = pointsToProcess;
-    }
-    if (!this.introStarted) {
       this.introStarted = true;
       this.startAssembly();
       this.updateStatus('Assembling hologram...');
@@ -769,14 +1004,15 @@ export class HouseOfCardsSystem extends createSystem({}) {
 
   /** Scatter every point into the void and restart the fly-in. */
   private startAssembly(): void {
+    this.assemblyRandom = mulberry32(this.assemblySeed);
     // Scatter the full capacity, not just the first frame's count: denser
     // frames decoded during streaming must not inherit zeroed starts.
     for (let i = 0; i < MAX_POINTS; i += 1) {
       // Random unit vector via spherical sampling.
-      const theta = Math.random() * Math.PI * 2;
-      const z = Math.random() * 2 - 1;
+      const theta = this.assemblyRandom() * Math.PI * 2;
+      const z = this.assemblyRandom() * 2 - 1;
       const r = Math.sqrt(Math.max(0, 1 - z * z));
-      const dist = 120 + Math.random() * 260;
+      const dist = 120 + this.assemblyRandom() * 260;
       const o = i * 3;
       this.scatterPos[o] = this.basePositions[o] + r * Math.cos(theta) * dist;
       this.scatterPos[o + 1] =
@@ -823,30 +1059,44 @@ export class HouseOfCardsSystem extends createSystem({}) {
   }
 
   update(delta: number): void {
-    if (this.loadedBytes > this.parserState.lastParsedBytes) {
-      advanceFrameParser(this.parserState, this.loadedBytes);
-    }
+    advanceFrameParser(this.parserState);
 
     const totalLoadedFrames = this.parserState.frames.length;
     if (totalLoadedFrames === 0) return;
+    if (this.parserState.parseError) return;
 
-    let targetFrame: number;
-    if (this.isPlaying && !this.audio.paused) {
-      // Sync against the full timeline, not the still-streaming subset;
-      // otherwise the effective playback rate changes as chunks land.
-      const timelineFrames = this.parserState.totalFrames || totalLoadedFrames;
-      targetFrame = Math.floor(this.audio.currentTime * FPS) % timelineFrames;
-      if (targetFrame >= totalLoadedFrames) {
-        targetFrame = totalLoadedFrames - 1;
+    // Hold the frame while assembling so the blend target stays stable and
+    // the decode upload is not duplicated every frame.
+    if (!this.introActive || this.currentFrame < 0) {
+      let targetFrame: number;
+      if (this.isPlaying && !this.audio.paused) {
+        // Sync against the full timeline, not the still-streaming subset;
+        // otherwise the effective playback rate changes as chunks land.
+        const timelineFrames =
+          this.parserState.totalFrames || totalLoadedFrames;
+        if (!Number.isFinite(timelineFrames) || timelineFrames <= 0) {
+          targetFrame = Math.floor(this.previewTime * FPS) % totalLoadedFrames;
+        } else {
+          targetFrame =
+            Math.floor(this.audio.currentTime * FPS) % timelineFrames;
+        }
+        if (
+          !Number.isFinite(targetFrame) ||
+          targetFrame < 0 ||
+          targetFrame >= totalLoadedFrames
+        ) {
+          targetFrame = totalLoadedFrames - 1;
+        }
+      } else {
+        // Gentle animated breathing loop through available frames even before audio starts
+        this.previewTime += delta;
+        targetFrame =
+          Math.floor(this.previewTime * FPS) % totalLoadedFrames;
       }
-    } else {
-      // Gentle animated breathing loop through available frames even before audio starts
-      this.previewTime += delta;
-      targetFrame = Math.floor(this.previewTime * FPS) % totalLoadedFrames;
-    }
 
-    if (targetFrame !== this.currentFrame) {
-      this.renderFrame(targetFrame);
+      if (targetFrame !== this.currentFrame) {
+        this.renderFrame(targetFrame);
+      }
     }
 
     // Fly-in assembly runs until every point has eased home.
