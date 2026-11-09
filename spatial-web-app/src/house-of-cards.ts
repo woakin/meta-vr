@@ -356,6 +356,9 @@ export class HouseOfCardsSystem extends createSystem({}) {
   private baseCount = 0;
   private basePositions = new Float32Array(MAX_POINTS * 3);
   private scatterPos = new Float32Array(MAX_POINTS * 3);
+  // Per-point (base - scatter) direction, filled once per assembly so
+  // updateAssembly blends with one multiply-add per component.
+  private assemblyDelta = new Float32Array(MAX_POINTS * 3);
 
   // Auto-hiding control deck.
   private panelAsset: UIKitMLAsset | null = null;
@@ -904,6 +907,19 @@ export class HouseOfCardsSystem extends createSystem({}) {
     }
   }
 
+  // Typed-array views over landed buffers. Buffers are immutable once
+  // landed, so views are cached and reused across decodes instead of
+  // allocating three views per rendered frame.
+  private chunkViews = new Map<
+    number,
+    { u8: Uint8Array; u16: Uint16Array; f32: Float32Array }
+  >();
+
+  private scratchViews = new WeakMap<
+    ArrayBuffer,
+    { u8: Uint8Array; u16: Uint16Array; f32: Float32Array }
+  >();
+
   private decodeFrameIntoAttributes(
     frame: FrameData,
     positions: Float32Array,
@@ -915,9 +931,25 @@ export class HouseOfCardsSystem extends createSystem({}) {
         ? this.parserState.chunks[frame.chunkIndex]
         : frame.scratch;
     if (!source) return 0;
-    const u8View = new Uint8Array(source);
-    const u16View = new Uint16Array(source);
-    const floatData = new Float32Array(source);
+    let views =
+      frame.chunkIndex >= 0
+        ? this.chunkViews.get(frame.chunkIndex)
+        : this.scratchViews.get(source);
+    if (!views) {
+      views = {
+        u8: new Uint8Array(source),
+        u16: new Uint16Array(source),
+        f32: new Float32Array(source),
+      };
+      if (frame.chunkIndex >= 0) {
+        this.chunkViews.set(frame.chunkIndex, views);
+      } else {
+        this.scratchViews.set(source, views);
+      }
+    }
+    const u8View = views.u8;
+    const u16View = views.u16;
+    const floatData = views.f32;
 
     if (
       this.parserState.isQuantized &&
@@ -1019,6 +1051,10 @@ export class HouseOfCardsSystem extends createSystem({}) {
         this.basePositions[o + 1] + r * Math.sin(theta) * dist;
       this.scatterPos[o + 2] = this.basePositions[o + 2] + z * dist;
     }
+    // Precompute (base - scatter) once per assembly.
+    for (let o = 0; o < MAX_POINTS * 3; o += 1) {
+      this.assemblyDelta[o] = this.basePositions[o] - this.scatterPos[o];
+    }
     this.introTime = 0;
     this.introActive = true;
   }
@@ -1028,22 +1064,19 @@ export class HouseOfCardsSystem extends createSystem({}) {
     this.introTime += delta;
     const positions = this.posAttr.array as Float32Array;
     const count = this.baseCount;
+    const staggerStep = count > 0 ? ASSEMBLE_STAGGER / count : 0;
+    const invSpan = 1 / ASSEMBLE_SPAN;
+    const time = this.introTime;
     let done = true;
     for (let i = 0; i < count; i += 1) {
-      const t =
-        (this.introTime - (i / count) * ASSEMBLE_STAGGER) / ASSEMBLE_SPAN;
+      const t = (time - i * staggerStep) * invSpan;
       if (t < 1) done = false;
       const clamped = t <= 0 ? 0 : t >= 1 ? 1 : t;
       const e = 1 - (1 - clamped) * (1 - clamped) * (1 - clamped);
       const o = i * 3;
-      positions[o] =
-        this.scatterPos[o] + (this.basePositions[o] - this.scatterPos[o]) * e;
-      positions[o + 1] =
-        this.scatterPos[o + 1] +
-        (this.basePositions[o + 1] - this.scatterPos[o + 1]) * e;
-      positions[o + 2] =
-        this.scatterPos[o + 2] +
-        (this.basePositions[o + 2] - this.scatterPos[o + 2]) * e;
+      positions[o] = this.scatterPos[o] + this.assemblyDelta[o] * e;
+      positions[o + 1] = this.scatterPos[o + 1] + this.assemblyDelta[o + 1] * e;
+      positions[o + 2] = this.scatterPos[o + 2] + this.assemblyDelta[o + 2] * e;
     }
     this.posAttr.clearUpdateRanges();
     this.posAttr.addUpdateRange(0, count * 3);
@@ -1067,6 +1100,7 @@ export class HouseOfCardsSystem extends createSystem({}) {
 
     // Hold the frame while assembling so the blend target stays stable and
     // the decode upload is not duplicated every frame.
+    const assemblingAtTickStart = this.introActive;
     if (!this.introActive || this.currentFrame < 0) {
       let targetFrame: number;
       if (this.isPlaying && !this.audio.paused) {
@@ -1099,8 +1133,12 @@ export class HouseOfCardsSystem extends createSystem({}) {
       }
     }
 
-    // Fly-in assembly runs until every point has eased home.
-    if (this.introActive) {
+    // Fly-in assembly runs until every point has eased home. Skip the
+    // blend on the activation tick: renderFrame just decoded and uploaded
+    // the scattered frame, so a second upload this frame is waste.
+    if (this.introActive && !assemblingAtTickStart) {
+      // No blend this tick; assembly starts from the uploaded scatter.
+    } else if (this.introActive) {
       this.updateAssembly(delta);
     }
 
