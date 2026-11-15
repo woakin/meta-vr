@@ -33,9 +33,9 @@
         "asset": "welcome-panel"
       },
       "transform": {
-        "position": [-1.7, 1.45, -1.55],
-        "rotationDeg": [0, 30, 0],
-        "scale": 0.17
+        "position": [0, 2.15, -1.9],
+        "rotationDeg": [0, 0, 0],
+        "scale": 0.1
       },
       "components": {
         "RayInteractable": {}
@@ -52,14 +52,7 @@
         "DirectionalLight": {
           "color": [0.85, 0.9, 1, 1],
           "intensity": 0.7,
-          "castShadow": false,
-          "shadowMapSize": "2048",
-          "shadowCameraSize": 8,
-          "shadowCameraNear": 2,
-          "shadowCameraFar": 24,
-          "shadowRadius": 7,
-          "shadowBias": -0.0004,
-          "shadowNormalBias": 0.02
+          "castShadow": false
         }
       }
     },

@@ -133,7 +133,7 @@
       <div class="wax-band">
         <div class="wax wax-a"></div><div class="wax wax-b"></div><div class="wax wax-c"></div><div class="wax wax-d"></div><div class="wax wax-e"></div><div class="wax wax-f"></div><div class="wax wax-b"></div><div class="wax wax-g"></div><div class="wax wax-d"></div><div class="wax wax-a"></div><div class="wax wax-f"></div><div class="wax wax-c"></div>
       </div>
-      <div class="body">Look &amp; Pinch the 3D hologram to grab and move it in space. On desktop: WASD to glide, E/C to float up/down.</div>
+      <div class="body">Look &amp; Pinch the 3D hologram to grab and move it in space. Desktop: WASD glide, E/C float, F comfort vignette, M reduced motion.</div>
       <div id="status-text" class="status">INITIALIZING LIDAR STREAM...</div>
     </div>
     <div class="controls-row">

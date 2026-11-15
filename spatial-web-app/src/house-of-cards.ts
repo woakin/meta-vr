@@ -43,6 +43,36 @@ const MAX_FLY_Y = 30;
 const ASSEMBLE_SPAN = 2.4;
 const ASSEMBLE_STAGGER = 2.8;
 const CHUNK_CONCURRENCY = 4;
+// Sliding-window memory guard: keep the chunk the playhead is in plus the
+// next K chunks and a small behind margin (~1s of frames). Older chunks are
+// released and re-fetched on loop wrap, so peak heap stays ~tens of MB
+// instead of the full ~205MB stream.
+const KEEP_AHEAD_CHUNKS = 6;
+const KEEP_BEHIND_FRAMES = 60;
+// Adaptive render budget: halve the active point count when the frame EMA
+// exceeds the 11ms (90Hz) line, recover when it falls below 9ms.
+const BUDGET_STEPS = [15000, 10000, 6000, 4000];
+const OVERLOAD_EMS_MS = 11;
+const RECOVER_EMS_MS = 9;
+const OVERLOAD_HOLD_S = 2;
+const RECOVER_HOLD_S = 4;
+// Measurement cadence for the status HUD (seconds between refreshes).
+const PERF_HUD_INTERVAL_S = 0.5;
+
+export { BUDGET_STEPS, OVERLOAD_EMS_MS, RECOVER_EMS_MS };
+
+// Pure budget stepper: one step toward lower detail when overloaded,
+// one step toward higher detail when headroom returns, otherwise hold.
+// The system applies hysteresis (sustained holds) before stepping.
+export function nextBudgetIndex(emsMs: number, budgetIndex: number): number {
+  if (emsMs > OVERLOAD_EMS_MS && budgetIndex < BUDGET_STEPS.length - 1) {
+    return budgetIndex + 1;
+  }
+  if (emsMs < RECOVER_EMS_MS && budgetIndex > 0) {
+    return budgetIndex - 1;
+  }
+  return budgetIndex;
+}
 
 function dataUrl(path: string): string {
   return `${import.meta.env.BASE_URL}${path.replace(/^\/+/u, '')}`;
@@ -367,6 +397,23 @@ export class HouseOfCardsSystem extends createSystem({}) {
   private camDir = new Vector3();
   private toPanel = new Vector3();
 
+  // --- Drift fix: performance instrumentation (Step 1) + adaptive budget (Step 3) ---
+  private emsMs = 16.7;
+  private fpsEma = 60;
+  private perfAccumS = 0;
+  private budgetIndex = 0;
+  private overloadHoldS = 0;
+  private recoverHoldS = 0;
+  private frameRateDropTried = false;
+  private vignetteMesh: Mesh | null = null;
+  private comfortMode = false;
+  private reducedMotion = false;
+  // Chunk-window state (Step 2): manifest + offsets retained so an evicted
+  // chunk can be re-fetched when the playhead wraps back to it.
+  private manifestChunks: { file: string; size?: number }[] = [];
+  private manifestOffsets: number[] = [];
+  private refetchInFlight = new Set<number>();
+
   init(): void {
     // 1. Set up audio element
     this.audio = new Audio(dataUrl('data/HouseOfCards_DataSample.mp3'));
@@ -374,6 +421,14 @@ export class HouseOfCardsSystem extends createSystem({}) {
     // Keep the initial network budget for the LiDAR stream; the MP3 buffers
     // when the user presses play.
     this.audio.preload = 'metadata';
+    try {
+      this.reducedMotion =
+        typeof window !== 'undefined' &&
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    } catch {
+      this.reducedMotion = false;
+    }
 
     // 2. Build Three.js Point Cloud geometry + custom VR ShaderMaterial
     const initialPositions = new Float32Array(MAX_POINTS * 3);
@@ -629,6 +684,16 @@ export class HouseOfCardsSystem extends createSystem({}) {
         if (e.repeat) return;
         e.preventDefault();
         this.resetHologram();
+      } else if (isActionKey(e, 'KeyF', 'f')) {
+        if (e.repeat) return;
+        e.preventDefault();
+        this.setComfortMode(!this.comfortMode);
+      } else if (isActionKey(e, 'KeyM', 'm')) {
+        if (e.repeat) return;
+        e.preventDefault();
+        this.reducedMotion = !this.reducedMotion;
+        if (!this.reducedMotion) this.startAssembly();
+        this.updateStatus(this.reducedMotion ? 'Reduced motion ON (M to disable)' : 'Reduced motion OFF');
       } else if (isFlyKey(e, 'KeyE', 'e')) {
         this.flyUp = true;
       } else if (isFlyKey(e, 'KeyC', 'c')) {
@@ -791,7 +856,7 @@ export class HouseOfCardsSystem extends createSystem({}) {
         chunks?: { file: string; size?: number }[];
       };
 
-      const totalSize = manifest.totalSize || 204880764;
+      const totalSize = manifest.totalSize || 134522836;
       const chunkList = manifest.chunks || [];
       if (chunkList.length === 0) {
         throw new Error('Manifest has no chunks');
@@ -811,6 +876,10 @@ export class HouseOfCardsSystem extends createSystem({}) {
           `Manifest size mismatch: chunks ${runningOffset} != total ${totalSize}`,
         );
       }
+
+      // Retain manifest for sliding-window eviction / on-demand re-fetch.
+      this.manifestChunks = chunkList;
+      this.manifestOffsets = offsets;
 
       // Load chunk 0 immediately for instant preview.
       const chunk0Buf = await this.fetchChunk(chunkList[0], 0);
@@ -920,17 +989,29 @@ export class HouseOfCardsSystem extends createSystem({}) {
     { u8: Uint8Array; u16: Uint16Array; f32: Float32Array }
   >();
 
+  private activeBudget(): number {
+    return BUDGET_STEPS[this.budgetIndex];
+  }
+
   private decodeFrameIntoAttributes(
     frame: FrameData,
     positions: Float32Array,
     intensities: Float32Array,
   ): number {
-    const pointsToProcess = Math.min(frame.numPoints, MAX_POINTS);
+    // Adaptive budget: stride-sample the frame down to the active budget
+    // instead of hard-truncating the tail.
+    const full = Math.min(frame.numPoints, MAX_POINTS);
+    const budget = Math.min(full, this.activeBudget());
+    const stride = full > budget ? full / budget : 1;
+    const pointsToProcess = budget;
     const source =
       frame.chunkIndex >= 0
         ? this.parserState.chunks[frame.chunkIndex]
         : frame.scratch;
-    if (!source) return 0;
+    if (!source) {
+      if (frame.chunkIndex >= 0) this.scheduleRefetch(frame.chunkIndex);
+      return 0;
+    }
     let views =
       frame.chunkIndex >= 0
         ? this.chunkViews.get(frame.chunkIndex)
@@ -969,29 +1050,208 @@ export class HouseOfCardsSystem extends createSystem({}) {
       let outIdx = 0;
 
       for (let i = 0; i < pointsToProcess; i++) {
-        positions[outIdx] = frameMinX + u16View[u16Idx] * scaleX;
-        positions[outIdx + 1] = frameMinY + u16View[u16Idx + 1] * scaleY;
-        positions[outIdx + 2] = frameMinZ + u16View[u16Idx + 2] * scaleZ;
-        intensities[i] = u8View[pOffset];
-
-        u16Idx += 4;
-        pOffset += 8;
+        const s = Math.min(full - 1, Math.floor(i * stride));
+        const su16 = u16Idx + s * 4;
+        const sp = pOffset + s * 8;
+        positions[outIdx] = frameMinX + u16View[su16] * scaleX;
+        positions[outIdx + 1] = frameMinY + u16View[su16 + 1] * scaleY;
+        positions[outIdx + 2] = frameMinZ + u16View[su16 + 2] * scaleZ;
+        intensities[i] = u8View[sp];
         outIdx += 3;
       }
     } else if (floatData && frame.floatOffset !== undefined) {
       let floatIdx = frame.floatOffset;
       let outIdx = 0;
       for (let i = 0; i < pointsToProcess; i++) {
-        positions[outIdx] = floatData[floatIdx];
-        positions[outIdx + 1] = floatData[floatIdx + 1];
-        positions[outIdx + 2] = floatData[floatIdx + 2];
-        intensities[i] = floatData[floatIdx + 3];
-
-        floatIdx += 4;
+        const s = Math.min(full - 1, Math.floor(i * stride));
+        const sf = floatIdx + s * 4;
+        positions[outIdx] = floatData[sf];
+        positions[outIdx + 1] = floatData[sf + 1];
+        positions[outIdx + 2] = floatData[sf + 2];
+        intensities[i] = floatData[sf + 3];
         outIdx += 3;
       }
     }
     return pointsToProcess;
+  }
+
+  // --- Sliding-window memory guard (Step 2) ---
+  // Release chunks that back only already-played frames beyond the behind
+  // margin, keeping the playhead chunk + KEEP_AHEAD_CHUNKS. Frames keep
+  // their descriptors; an evicted chunk is re-fetched on demand (wrap-around).
+  private evictChunksBehindPlayhead(): void {
+    if (this.currentFrame < 0 || this.manifestChunks.length === 0) return;
+    const floorFrame = Math.max(0, this.currentFrame - KEEP_BEHIND_FRAMES);
+    // Windowed both ways: keep the playhead chunk + KEEP_AHEAD_CHUNKS ahead
+    // (≈7s of frames) and the behind margin. Far-ahead parsed frames are
+    // released and re-fetched when the playhead approaches (no stall beyond
+    // one chunk fetch, parallel to playback).
+    const headFrame = this.parserState.frames[this.currentFrame];
+    const headChunk = headFrame ? headFrame.chunkIndex : -1;
+    const needed = new Set<number>();
+    for (let f = floorFrame; f < this.parserState.frames.length; f++) {
+      const ci = this.parserState.frames[f].chunkIndex;
+      if (ci < 0) continue;
+      if (headChunk >= 0 && ci > headChunk + KEEP_AHEAD_CHUNKS) continue;
+      needed.add(ci);
+    }
+    // Always keep the playhead chunk itself even with 0-degree coverage.
+    if (headFrame && headFrame.chunkIndex >= 0) needed.add(headFrame.chunkIndex);
+    for (let i = 0; i < this.parserState.chunks.length; i++) {
+      if (!this.parserState.chunks[i] || needed.has(i)) continue;
+      // Never evict bytes the forward parser has not consumed yet; only
+      // fully-consumed chunks behind the playhead margin are released.
+      const end = this.manifestOffsets[i] + (this.manifestChunks[i].size ?? 0);
+      if (end > this.parserState.nextByteOffset) continue;
+      this.parserState.chunks[i] = null;
+      this.chunkViews.delete(i);
+    }
+    // Scratch pool bounded to the window; entries are dropped by GC once
+    // their views are released (WeakMap), scratch is small and bounded.
+    if (this.parserState.scratchPool.length > 32) {
+      this.parserState.scratchPool.splice(0, this.parserState.scratchPool.length - 32);
+    }
+  }
+
+  private scheduleRefetch(chunkIndex: number): void {
+    if (
+      this.refetchInFlight.has(chunkIndex) ||
+      !this.manifestChunks[chunkIndex] ||
+      this.parserState.chunks[chunkIndex]
+    ) {
+      return;
+    }
+    this.refetchInFlight.add(chunkIndex);
+    void (async () => {
+      try {
+        const buf = await this.fetchChunk(this.manifestChunks[chunkIndex], chunkIndex);
+        if (!this.parserState.chunks[chunkIndex]) {
+          this.parserState.chunks[chunkIndex] = buf;
+          this.parserState.chunkOffsets[chunkIndex] = this.manifestOffsets[chunkIndex];
+        }
+      } catch {
+        // Refetch failures surface on the next decode attempt; do not latch.
+      } finally {
+        this.refetchInFlight.delete(chunkIndex);
+      }
+    })();
+  }
+
+  // --- Comfort vignette (Step 6): camera-attached dark rims, toggleable ---
+  private ensureComfortVignette(): void {
+    if (this.vignetteMesh) return;
+    const mat = new ShaderMaterial({
+      uniforms: {},
+      vertexShader:
+        'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }',
+      fragmentShader:
+        'varying vec2 vUv; void main(){ float d = length(vUv - vec2(0.5)) * 2.0;' +
+        ' float a = smoothstep(0.55, 1.15, d) * 0.85; gl_FragColor = vec4(0.0,0.0,0.0,a); }',
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+    });
+    const mesh = new Mesh(new PlaneGeometry(2, 2), mat);
+    mesh.material = mat;
+    mesh.position.set(0, 0, -0.5);
+    mesh.visible = false;
+    mesh.renderOrder = 999;
+    (this.world.camera as unknown as { add: (o: unknown) => void }).add(mesh);
+    this.vignetteMesh = mesh;
+    this.cleanupFuncs.push(() => {
+      mesh.removeFromParent();
+      mesh.geometry.dispose();
+      mat.dispose();
+    });
+  }
+
+  private setComfortMode(on: boolean): void {
+    this.comfortMode = on;
+    this.ensureComfortVignette();
+    if (this.vignetteMesh) this.vignetteMesh.visible = on;
+    this.updateStatus(on ? 'Comfort vignette ON (F to disable)' : 'Comfort vignette OFF (F to enable)');
+  }
+
+  // --- Performance instrumentation + adaptive budget (Steps 1 & 3) ---
+  private updatePerfAndBudget(delta: number): void {
+    const ms = delta * 1000;
+    if (ms > 0 && ms < 500) {
+      this.emsMs = this.emsMs * 0.9 + ms * 0.1;
+      this.fpsEma = this.fpsEma * 0.9 + (1000 / ms) * 0.1;
+    }
+    if (this.emsMs > OVERLOAD_EMS_MS && this.budgetIndex < BUDGET_STEPS.length - 1) {
+      this.overloadHoldS += delta;
+      this.recoverHoldS = 0;
+      if (this.overloadHoldS > OVERLOAD_HOLD_S) {
+        this.budgetIndex = nextBudgetIndex(this.emsMs, this.budgetIndex);
+        this.overloadHoldS = 0;
+        this.maybeLowerNominalFrameRate();
+      }
+    } else if (this.emsMs < RECOVER_EMS_MS && this.budgetIndex > 0) {
+      this.recoverHoldS += delta;
+      this.overloadHoldS = 0;
+      if (this.recoverHoldS > RECOVER_HOLD_S) {
+        this.budgetIndex = nextBudgetIndex(this.emsMs, this.budgetIndex);
+        this.recoverHoldS = 0;
+      }
+    } else {
+      this.overloadHoldS = 0;
+      this.recoverHoldS = 0;
+    }
+    this.perfAccumS += delta;
+    if (this.perfAccumS >= PERF_HUD_INTERVAL_S) {
+      this.perfAccumS = 0;
+      this.refreshPerfHud();
+    }
+  }
+
+  private getXrSession(): { frameRate?: number; supportedFrameRates?: number[]; updateTargetFrameRate?: (r: number) => Promise<void> } | null {
+    try {
+      const w = this.world as unknown as { xrSession?: unknown };
+      return (w.xrSession as { frameRate?: number; supportedFrameRates?: number[]; updateTargetFrameRate?: (r: number) => Promise<void> } | undefined) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private maybeLowerNominalFrameRate(): void {
+    if (this.frameRateDropTried) return;
+    const session = this.getXrSession();
+    if (!session?.supportedFrameRates?.length || !session.updateTargetFrameRate) return;
+    const rates = [...session.supportedFrameRates].sort((a, b) => a - b);
+    const current = session.frameRate ?? rates[rates.length - 1];
+    const lower = rates.filter((r) => r < current);
+    if (lower.length === 0) return;
+    this.frameRateDropTried = true;
+    void session.updateTargetFrameRate(lower[lower.length - 1]).catch(() => undefined);
+  }
+
+  private refreshPerfHud(): void {
+    if (!this.statusLabel || this.parserState.frames.length === 0) return;
+    const session = this.getXrSession();
+    const target = session?.frameRate != null ? `${Math.round(session.frameRate)}Hz` : 'flat';
+    const ems = this.emsMs.toFixed(1);
+    const fps = Math.round(this.fpsEma);
+    const pts = this.activeBudget();
+    const evicted = this.parserState.chunks.filter((c) => c === null).length;
+    const retainedMB = Math.round(
+      this.parserState.chunks.reduce((a, c) => a + (c ? c.byteLength : 0), 0) / 1048576,
+    );
+    (window as unknown as { __hocPerf?: unknown }).__hocPerf = {
+      ems: Number(ems),
+      fps,
+      target,
+      pts,
+      budgetIndex: this.budgetIndex,
+      frames: this.parserState.frames.length,
+      retainedChunks: this.parserState.chunks.length - evicted,
+      retainedMB,
+    };
+    // Only overwrite the status line once streaming is under way; while
+    // loading, loadChunkStream owns the copy.
+    if (this.loadedBytes > 0 && this.currentFrame >= 0) {
+      this.updateStatus(`${fps}fps ${ems}ms ${target} pts${pts} | frames ${this.parserState.frames.length} retained ${retainedMB}MB`);
+    }
   }
 
   private renderFrame(targetFrame: number): void {
@@ -1020,6 +1280,7 @@ export class HouseOfCardsSystem extends createSystem({}) {
 
     this.geometry.setDrawRange(0, pointsToProcess);
     this.currentFrame = targetFrame;
+    this.evictChunksBehindPlayhead();
 
     // Snapshot the pristine frame only when an assembly can consume it.
     // Copying 45k floats on every normal playback frame is wasted bandwidth.
@@ -1036,6 +1297,10 @@ export class HouseOfCardsSystem extends createSystem({}) {
 
   /** Scatter every point into the void and restart the fly-in. */
   private startAssembly(): void {
+    if (this.reducedMotion) {
+      this.introActive = false;
+      return;
+    }
     this.assemblyRandom = mulberry32(this.assemblySeed);
     // Scatter the full capacity, not just the first frame's count: denser
     // frames decoded during streaming must not inherit zeroed starts.
@@ -1092,6 +1357,9 @@ export class HouseOfCardsSystem extends createSystem({}) {
   }
 
   update(delta: number): void {
+    // Pause simulation while the tab is blurred (visibility-driven pause).
+    if (this.world.visibilityState.peek() === VisibilityState.VisibleBlurred) return;
+    this.updatePerfAndBudget(delta);
     advanceFrameParser(this.parserState);
 
     const totalLoadedFrames = this.parserState.frames.length;
@@ -1154,12 +1422,12 @@ export class HouseOfCardsSystem extends createSystem({}) {
       this.shaderMaterial.uniforms.pointSize.value = presenting ? 2.1 : 3.4;
     }
 
-    // Auto-hiding control deck (desktop only — the XR exit button must stay
-    // reachable in-headset). While the track plays, the card hides after a
-    // few seconds and returns the moment you look its way or pause.
+    // Auto-hiding control deck: while the track plays, the card hides after
+    // a few seconds away from gaze and returns the moment you look at it or
+    // pause. Immersive gets a longer dwell (8s) so the exit control stays
+    // reachable, but it still yields during playback.
     if (this.panelAsset) {
-      const immersive = presenting;
-      if (!this.isPlaying || immersive) {
+      if (!this.isPlaying) {
         this.panelAsset.visible = true;
         this.hideTimer = 0;
       } else {
@@ -1172,7 +1440,8 @@ export class HouseOfCardsSystem extends createSystem({}) {
           this.hideTimer = 0;
         } else {
           this.hideTimer += delta;
-          if (this.hideTimer > 5) this.panelAsset.visible = false;
+          const dwell = presenting ? 8 : 5;
+          if (this.hideTimer > dwell) this.panelAsset.visible = false;
         }
       }
     }
